@@ -22,6 +22,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") == "1"
+
 # Basic URL regex and allowed hosts
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 ALLOWED_HOST_KEYWORDS = (
@@ -34,6 +36,24 @@ ALLOWED_HOST_KEYWORDS = (
 
 # Warn for extremely large files
 HARD_WARN_BYTES = 1_800 * 1024 * 1024  # ~1.8 GB
+
+
+def get_proxy_url() -> Optional[str]:
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+        val = os.getenv(key)
+        if val:
+            return val
+    return None
+
+
+def build_requests_proxies() -> Optional[dict]:
+    proxy = get_proxy_url()
+    if not proxy:
+        return None
+    return {
+        "http": proxy,
+        "https": proxy,
+    }
 
 
 def is_allowed_link(url: str) -> bool:
@@ -52,9 +72,16 @@ def extract_first_url(text: str) -> Optional[str]:
 
 def resolve_redirects(url: str, timeout: int = 12) -> str:
     try:
-        resp = requests.get(url, allow_redirects=True, timeout=timeout, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        })
+        proxies = build_requests_proxies()
+        resp = requests.get(
+            url,
+            allow_redirects=True,
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            },
+            proxies=proxies,
+        )
         return resp.url if resp.url else url
     except Exception:
         return url
@@ -100,26 +127,31 @@ def build_ydl_opts_for(url: str, download_dir: Path) -> dict:
     elif Path("/home/container/cookies.txt").is_file():
         cookiefile = "/home/container/cookies.txt"
 
+    proxy_url = get_proxy_url()
+
     ydl_opts = {
         "outtmpl": str(download_dir / "%(title).180B.%(ext)s"),
         "format": "bv*+ba/b/best",
         "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": not DEBUG_ERRORS,
+        "no_warnings": not DEBUG_ERRORS,
         "merge_output_format": "mp4",
         "http_headers": headers,
         "extractor_args": extractor_args,
-        "retries": 5,
-        "fragment_retries": 5,
-        "socket_timeout": 20,
+        "retries": 7,
+        "fragment_retries": 7,
+        "socket_timeout": 25,
         "geo_bypass": True,
-        # Helps in some environments
         "force_ipv4": True,
     }
 
     if cookiefile:
         ydl_opts["cookiefile"] = cookiefile
         logger.info("Using cookies file: %s", cookiefile)
+
+    if proxy_url:
+        ydl_opts["proxy"] = proxy_url
+        logger.info("Using proxy: %s", proxy_url)
 
     return ydl_opts
 
@@ -217,14 +249,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             else:
                 raise
 
-    except yt_dlp.utils.DownloadError:
+    except yt_dlp.utils.DownloadError as e:
         logger.exception("yt-dlp download error")
-        await notice.edit_text(
-            "Failed to download this link. If this persists, add a cookies.txt file (see README) and try again."
-        )
-    except Exception:
+        if DEBUG_ERRORS:
+            await notice.edit_text(f"Download failed: {e!s}")
+        else:
+            await notice.edit_text(
+                "Failed to download this link. If this persists, add a cookies.txt file (see README) and try again."
+            )
+    except Exception as e:
         logger.exception("Unexpected error")
-        await notice.edit_text("An unexpected error occurred while processing your link.")
+        if DEBUG_ERRORS:
+            await notice.edit_text(f"Unexpected error: {e!s}")
+        else:
+            await notice.edit_text("An unexpected error occurred while processing your link.")
     finally:
         try:
             if file_path is not None:
@@ -239,6 +277,10 @@ def main() -> None:
     token = TELEGRAM_BOT_TOKEN
     if not token:
         raise RuntimeError("Telegram bot token not configured.")
+
+    proxy = get_proxy_url()
+    if proxy:
+        logger.info("Environment proxy detected: %s", proxy)
 
     app = Application.builder().token(token).build()
 
