@@ -6,8 +6,8 @@ import os
 from typing import List, Dict
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.constants import ChatAction
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, BotCommand
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.persona import build_system_prompt, get_bot_name
@@ -34,6 +34,15 @@ async def send_typing_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -
         pass
 
 
+async def send_typing_action_periodic(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop_event: asyncio.Event) -> None:
+    try:
+        while not stop_event.is_set():
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await asyncio.sleep(3)
+    except Exception:
+        pass
+
+
 def ensure_llm() -> LLMClient:
     global llm_client
     if llm_client is None:
@@ -49,25 +58,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "صديقك الرقمي المرح — أسعد بمساعدتك في أي شيء: أسئلة عامة، كتابة نصوص إبداعية، تلخيصات، أفكار مشاريع، وحتى تنظيم يومك!\n"
         "ما أول شيء تحب نبدأ به اليوم؟ 😊"
     )
-    await update.message.reply_text(greeting)
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("✍️ اكتب لي رسالة"), KeyboardButton("💡 اقترح فكرة")],
+         [KeyboardButton("🧠 لخص هذا"), KeyboardButton("🧹 اعادة ضبط الذاكرة")] ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+    await update.message.reply_text(greeting, reply_markup=keyboard)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot_name = get_bot_name()
     help_text = (
         f"أنا {bot_name} — روبوت دردشة ذكي وودود 😄\n\n"
-        "أستطيع: \n"
+        "أستطيع:\n"
         "- الإجابة عن الأسئلة في مجالات متعددة.\n"
         "- كتابة نصوص إبداعية (قصائد، قصص، نصوص أغاني وإعلانات).\n"
         "- توليد أفكار واقتراحات للعصف الذهني.\n"
         "- المساعدة اليومية: تنظيم الجداول، صياغة الرسائل، تلخيص المقالات.\n\n"
-        "أوامر سريعة: \n"
+        "أوامر سريعة:\n"
         "/start — بدء محادثة جديدة\n"
         "/help — هذه المساعدة\n"
         "/reset — نسيان سياق المحادثة الحالي\n\n"
         "جاهز دائماً — ماذا يدور في بالك الآن؟ 💡"
     )
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -87,14 +102,19 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat_id = update.effective_chat.id
     user_text = update.message.text.strip()
 
+    if user_text == "🧹 اعادة ضبط الذاكرة":
+        await cmd_reset(update, context)
+        return
+
     # Store user message
     chat_store.add_user_message(chat_id, user_text)
 
-    # Send typing indicator while generating
-    await send_typing_action(context, chat_id)
+    # Periodic typing while generating
+    stop_event = asyncio.Event()
+    typing_task = asyncio.create_task(send_typing_action_periodic(context, chat_id, stop_event))
 
     # Build prompt and history
-    system_prompt = build_system_prompt()
+    system_prompt = build_system_prompt(update.effective_user.first_name if update.effective_user else None)
     history_messages = _build_history_for_llm(chat_id)
 
     try:
@@ -104,11 +124,14 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_text = (
             "همم… يبدو أن هناك مشكلة تقنية صغيرة الآن 😅. سأحاول مجدداً بعد لحظات."
         )
+    finally:
+        stop_event.set()
+        await typing_task
 
     # Save assistant reply
     chat_store.add_assistant_message(chat_id, reply_text)
 
-    await update.message.reply_text(reply_text)
+    await update.message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
 
 
 async def main_async() -> None:
@@ -123,6 +146,13 @@ async def main_async() -> None:
         .build()
     )
 
+    # Bot menu commands
+    await application.bot.set_my_commands([
+        BotCommand("start", "بدء محادثة جديدة"),
+        BotCommand("help", "المساعدة"),
+        BotCommand("reset", "إعادة ضبط الذاكرة"),
+    ])
+
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("reset", cmd_reset))
@@ -136,7 +166,6 @@ async def main_async() -> None:
 
     try:
         await application.updater.start_polling()
-        # Keep running until interrupted
         await asyncio.Event().wait()
     finally:
         await application.updater.stop()
