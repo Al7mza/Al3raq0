@@ -197,7 +197,7 @@ def main() -> None:
     if not token:
         raise RuntimeError("Telegram bot token not configured.")
 
-    app = ApplicationBuilder().token(token).concurrent_updates(True).build()
+    app = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
