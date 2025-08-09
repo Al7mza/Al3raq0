@@ -50,10 +50,7 @@ def build_requests_proxies() -> Optional[dict]:
     proxy = get_proxy_url()
     if not proxy:
         return None
-    return {
-        "http": proxy,
-        "https": proxy,
-    }
+    return {"http": proxy, "https": proxy}
 
 
 def is_allowed_link(url: str) -> bool:
@@ -87,6 +84,41 @@ def resolve_redirects(url: str, timeout: int = 12) -> str:
         return url
 
 
+def bootstrap_cookies_for_domain(domain: str) -> Optional[str]:
+    """Attempt to obtain essential cookies (e.g., ttwid) for douyin.com/tiktok.com."""
+    try:
+        scheme = "https://"
+        url = f"{scheme}{domain}/"
+        proxies = build_requests_proxies()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": (
+                "zh-CN,zh;q=0.9,en;q=0.8" if "douyin" in domain else "en-US,en;q=0.9"
+            ),
+            "Referer": url,
+        }
+        session = requests.Session()
+        resp = session.get(url, headers=headers, timeout=10, proxies=proxies)
+        # Build Cookie header from session cookies filtered to the domain
+        cookie_items = []
+        for c in session.cookies:
+            if not c.name or not c.value:
+                continue
+            # Keep common keys that help access
+            if c.domain and (domain in c.domain):
+                cookie_items.append(f"{c.name}={c.value}")
+            elif c.domain and ("bytedance" in c.domain or "tiktok" in c.domain or "douyin" in c.domain):
+                cookie_items.append(f"{c.name}={c.value}")
+        cookie_str = "; ".join(dict.fromkeys(cookie_items))  # dedupe order-preserving
+        return cookie_str or None
+    except Exception:
+        return None
+
+
 def build_ydl_opts_for(url: str, download_dir: Path) -> dict:
     parsed = urlparse(url)
     host = (parsed.netloc or "").lower()
@@ -103,19 +135,12 @@ def build_ydl_opts_for(url: str, download_dir: Path) -> dict:
 
     if "douyin.com" in host or "iesdouyin.com" in host:
         headers["Referer"] = "https://www.douyin.com/"
-        extractor_args = {
-            "douyin": {
-                "webpage": ["1"],
-            }
-        }
+        headers["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.8"
+        extractor_args = {"douyin": {"webpage": ["1"]}}
     else:
         headers["Referer"] = "https://www.tiktok.com/"
-        extractor_args = {
-            "tiktok": {
-                "player_url": ["1"],
-                "webpage": ["1"],
-            }
-        }
+        headers["Accept-Language"] = "en-US,en;q=0.9"
+        extractor_args = {"tiktok": {"player_url": ["1"], "webpage": ["1"]}}
 
     # Optional cookies support
     cookiefile = None
@@ -126,6 +151,14 @@ def build_ydl_opts_for(url: str, download_dir: Path) -> dict:
         cookiefile = "cookies.txt"
     elif Path("/home/container/cookies.txt").is_file():
         cookiefile = "/home/container/cookies.txt"
+
+    # If no cookiefile, try to bootstrap a minimal Cookie header (ttwid etc.)
+    if not cookiefile:
+        base_domain = "douyin.com" if "douyin" in host else "tiktok.com"
+        cookie_header = bootstrap_cookies_for_domain(base_domain)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+            logger.info("Bootstrapped cookies for %s", base_domain)
 
     proxy_url = get_proxy_url()
 
