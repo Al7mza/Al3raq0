@@ -3,7 +3,7 @@
 This bot downloads high-quality videos from TikTok (global) and Douyin (Chinese TikTok) and sends them back in Telegram.
 
 ### What’s included
-- `bot.py`: Telegram bot source code using python-telegram-bot v20 and yt-dlp
+- `bot.py`: Telegram bot source code using python-telegram-bot v21 and yt-dlp
 - `app.py`: Entrypoint compatible with hosts expecting `/home/container/app.py`
 - `requirements.txt`: Dependencies
 
@@ -37,7 +37,18 @@ python app.py
 
 Send a TikTok or Douyin URL to the bot in a private chat.
 
+### Optional: Pass cookies for higher success rate
+Some regions and accounts require cookies to access TikTok/Douyin. Provide cookies to yt-dlp in Netscape format:
+1. Export cookies for `tiktok.com` and/or `douyin.com` using a browser extension (e.g., "Get cookies.txt" for Chrome/Firefox).
+2. Save as `cookies.txt` in the same directory as `bot.py` (or set `COOKIES_FILE` env var to an absolute path).
+3. On some panels, place it at `/home/container/cookies.txt`.
+
+The bot auto-detects the file at:
+- `./cookies.txt`
+- value of `COOKIES_FILE` env var
+- `/home/container/cookies.txt`
+
 ### Notes
-- The bot attempts to fetch the best available quality.
-- Telegram bots have a file size limit. If a video exceeds the upload limit, the bot will notify you instead of uploading the file.
-- If a share link is shortened (e.g., `vm.tiktok.com` or `v.douyin.com`), the bot resolves it automatically.
+- The bot attempts to fetch the best available quality and merges streams.
+- If a shortened link is used (e.g., `vm.tiktok.com`, `v.douyin.com`), the bot resolves it automatically.
+- If you see "Failed to download this link...", try adding `cookies.txt` as above.

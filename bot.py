@@ -1,8 +1,10 @@
 import logging
+import os
 import re
 import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 import yt_dlp
@@ -58,7 +60,46 @@ def resolve_redirects(url: str, timeout: int = 12) -> str:
         return url
 
 
-def _download_with_ytdlp(url: str, download_dir: Path) -> Tuple[Path, dict]:
+def build_ydl_opts_for(url: str, download_dir: Path) -> dict:
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+
+    # Default headers mimic a desktop browser
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+    }
+
+    extractor_args = {}
+
+    if "douyin.com" in host or "iesdouyin.com" in host:
+        headers["Referer"] = "https://www.douyin.com/"
+        extractor_args = {
+            "douyin": {
+                "webpage": ["1"],
+            }
+        }
+    else:
+        headers["Referer"] = "https://www.tiktok.com/"
+        extractor_args = {
+            "tiktok": {
+                "player_url": ["1"],
+                "webpage": ["1"],
+            }
+        }
+
+    # Optional cookies support
+    cookiefile = None
+    env_cookie = os.environ.get("COOKIES_FILE")
+    if env_cookie and Path(env_cookie).is_file():
+        cookiefile = env_cookie
+    elif Path("cookies.txt").is_file():
+        cookiefile = "cookies.txt"
+    elif Path("/home/container/cookies.txt").is_file():
+        cookiefile = "/home/container/cookies.txt"
+
     ydl_opts = {
         "outtmpl": str(download_dir / "%(title).180B.%(ext)s"),
         "format": "bv*+ba/b/best",
@@ -66,11 +107,25 @@ def _download_with_ytdlp(url: str, download_dir: Path) -> Tuple[Path, dict]:
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Referer": "https://www.tiktok.com/",
-        },
+        "http_headers": headers,
+        "extractor_args": extractor_args,
+        "retries": 5,
+        "fragment_retries": 5,
+        "socket_timeout": 20,
+        "geo_bypass": True,
+        # Helps in some environments
+        "force_ipv4": True,
     }
+
+    if cookiefile:
+        ydl_opts["cookiefile"] = cookiefile
+        logger.info("Using cookies file: %s", cookiefile)
+
+    return ydl_opts
+
+
+def _download_with_ytdlp(url: str, download_dir: Path) -> Tuple[Path, dict]:
+    ydl_opts = build_ydl_opts_for(url, download_dir)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -164,7 +219,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     except yt_dlp.utils.DownloadError:
         logger.exception("yt-dlp download error")
-        await notice.edit_text("Failed to download this link. It may be unavailable or blocked.")
+        await notice.edit_text(
+            "Failed to download this link. If this persists, add a cookies.txt file (see README) and try again."
+        )
     except Exception:
         logger.exception("Unexpected error")
         await notice.edit_text("An unexpected error occurred while processing your link.")
