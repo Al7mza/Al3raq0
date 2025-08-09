@@ -1,3 +1,3 @@
 yt-dlp>=2024.04.09
-python-telegram-bot==20.7
+python-telegram-bot==21.6
 requests>=2.31.0

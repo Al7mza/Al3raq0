@@ -1,6 +1,4 @@
-import asyncio
 import logging
-import os
 import re
 import tempfile
 from pathlib import Path
@@ -9,9 +7,8 @@ from typing import Optional, Tuple
 import requests
 import yt_dlp
 from telegram import InputFile, Update
-from telegram.constants import ChatAction
 from telegram.error import TelegramError
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # User-provided bot token (embedded as requested)
 TELEGRAM_BOT_TOKEN = "8217318799:AAF6SEzDub4f3QK7P5p76QL4uBMwalqI7WY"
@@ -33,8 +30,7 @@ ALLOWED_HOST_KEYWORDS = (
     "v.douyin.com",
 )
 
-# Try to upload large files; Telegram bot API supports large uploads now, but errors if too big
-# We'll still warn if extremely large to avoid wasteful attempts.
+# Warn for extremely large files
 HARD_WARN_BYTES = 1_800 * 1024 * 1024  # ~1.8 GB
 
 
@@ -54,7 +50,6 @@ def extract_first_url(text: str) -> Optional[str]:
 
 def resolve_redirects(url: str, timeout: int = 12) -> str:
     try:
-        # Resolve common short share links (vm.tiktok.com, v.douyin.com, etc.)
         resp = requests.get(url, allow_redirects=True, timeout=timeout, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
         })
@@ -64,17 +59,13 @@ def resolve_redirects(url: str, timeout: int = 12) -> str:
 
 
 def _download_with_ytdlp(url: str, download_dir: Path) -> Tuple[Path, dict]:
-    """Blocking download via yt-dlp. Returns (file_path, info_dict)."""
     ydl_opts = {
         "outtmpl": str(download_dir / "%(title).180B.%(ext)s"),
-        # Prefer highest quality video+audio; fallback to best single stream
         "format": "bv*+ba/b/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        # Merge to mp4 when needed
         "merge_output_format": "mp4",
-        # Occasionally helpful for TikTok/Douyin
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Referer": "https://www.tiktok.com/",
@@ -83,12 +74,10 @@ def _download_with_ytdlp(url: str, download_dir: Path) -> Tuple[Path, dict]:
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # yt-dlp returns filename via prepare_filename; ensure we get the actual final file
         filename = ydl.prepare_filename(info)
 
     file_path = Path(filename)
     if not file_path.exists():
-        # Try locating any resulting mp4 in dir as a fallback
         candidates = sorted(download_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not candidates:
             raise FileNotFoundError("Downloaded file not found.")
@@ -98,22 +87,22 @@ def _download_with_ytdlp(url: str, download_dir: Path) -> Tuple[Path, dict]:
 
 
 async def download_video(url: str) -> Tuple[Path, dict]:
-    resolved = await asyncio.to_thread(resolve_redirects, url)
-    download_dir_obj = tempfile.TemporaryDirectory(prefix="ttdl_")
-    download_dir = Path(download_dir_obj.name)
+    from asyncio import to_thread
+
+    resolved = await to_thread(resolve_redirects, url)
+    tmpdir = tempfile.TemporaryDirectory(prefix="ttdl_")
+    dldir = Path(tmpdir.name)
 
     try:
-        file_path, info = await asyncio.to_thread(_download_with_ytdlp, resolved, download_dir)
-        # Attach the tempdir object to file_path so it can be cleaned later
-        file_path.tempdir_obj = download_dir_obj  # type: ignore[attr-defined]
+        file_path, info = await to_thread(_download_with_ytdlp, resolved, dldir)
+        file_path.tempdir_obj = tmpdir  # type: ignore[attr-defined]
         return file_path, info
-    except Exception as e:
-        # Ensure temp dir is cleaned on failure
+    except Exception:
         try:
-            download_dir_obj.cleanup()
+            tmpdir.cleanup()
         except Exception:
             pass
-        raise e
+        raise
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -137,7 +126,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not url or not is_allowed_link(url):
         return
 
-    await message.reply_chat_action(action=ChatAction.TYPING)
     notice = await message.reply_text("Downloading your video... This may take a few seconds.")
 
     file_path: Optional[Path] = None
@@ -154,7 +142,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
 
         caption = info.get("title") or "TikTok/Douyin video"
-        await message.reply_chat_action(action=ChatAction.UPLOAD_VIDEO)
         try:
             with file_path.open("rb") as f:
                 await message.reply_video(
@@ -182,7 +169,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.exception("Unexpected error")
         await notice.edit_text("An unexpected error occurred while processing your link.")
     finally:
-        # Cleanup temp directory
         try:
             if file_path is not None:
                 tempdir_obj = getattr(file_path, "tempdir_obj", None)
@@ -197,14 +183,14 @@ def main() -> None:
     if not token:
         raise RuntimeError("Telegram bot token not configured.")
 
-    app = ApplicationBuilder().token(token).build()
+    app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Bot is starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
