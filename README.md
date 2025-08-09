@@ -4,6 +4,7 @@ This bot downloads high-quality videos from TikTok (global) and Douyin (Chinese 
 
 ### What’s included
 - `bot.py`: Telegram bot source code using python-telegram-bot v20 and yt-dlp
+- `app.py`: Entrypoint compatible with hosts expecting `/home/container/app.py`
 - `requirements.txt`: Dependencies
 
 ### Prerequisites
@@ -23,9 +24,15 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Run
+### Run (local)
 ```bash
 python bot.py
+```
+
+### Run (hosts expecting app.py)
+Some hosting panels run `/home/container/app.py` by default. This repo includes `app.py` which forwards to the bot.
+```bash
+python app.py
 ```
 
 Send a TikTok or Douyin URL to the bot in a private chat.
