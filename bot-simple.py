@@ -19,12 +19,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configuration
-BOT_TOKEN = os.getenv('BOT_TOKEN', '8217318799:AAF6SEzDub4f3QK7P5p76QL4uBMwalqI7WY')
+BOT_TOKEN = os.getenv('BOT_TOKEN', '8217318799:AAF6SEzDub4f3QK7P5p76QL4uBMwatqI7WY')
 ADMIN_USER_IDS = [int(x.strip()) for x in os.getenv('ADMIN_USER_IDS', '1694244496').split(',') if x.strip()]
 UPLOAD_FOLDER = 'uploads'
 DATABASE_PATH = 'treasure_map.db'
 DEFAULT_SIMILARITY_THRESHOLD = 15.0
 ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp'}
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', 'AIzaSyBiW7vLyDMRpcZcWdawzmPXjZqL5rSsl1k')
 
 # Create uploads directory if it doesn't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)

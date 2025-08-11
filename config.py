@@ -20,6 +20,9 @@ DATABASE_PATH = 'treasure_map.db'
 DEFAULT_LANGUAGE = 'eng+chi_sim'  # English + Chinese Simplified
 TESSERACT_CONFIG = '--psm 6 --oem 3'
 
+# Google API Configuration
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', 'AIzaSyBiW7vLyDMRpcZcWdawzmPXjZqL5rSsl1k')
+
 # Similarity Configuration
 DEFAULT_SIMILARITY_THRESHOLD = 15.0  # 15% minimum similarity
 
