@@ -30,6 +30,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import requests
+import re
+import jieba
+from hanziconv import HanziConv
 from fuzzywuzzy import fuzz
 from telegram import Update
 from telegram.constants import ChatAction
@@ -55,7 +58,6 @@ OCR_API_ENDPOINT: str = "https://api.ocr.space/parse/image"
 OCR_TIMEOUT_SECONDS: int = 30
 
 # Preprocessing toggles
-# Try multiple variants on the FULL image (not only yellow areas)
 OCR_VARIANTS: List[str] = [
     "original",
     "gray_otsu",
@@ -68,8 +70,14 @@ OCR_VARIANTS: List[str] = [
 IMAGES_DIR: str = "images"
 DB_PATH: str = "database.json"
 
-# Similarity threshold
-SIMILARITY_THRESHOLD: int = 80
+# Similarity thresholds and weights
+SIMILARITY_THRESHOLD: int = int(os.environ.get("SIMILARITY_THRESHOLD", "80"))
+WEIGHT_CHAR_RATIO: float = float(os.environ.get("WEIGHT_CHAR_RATIO", "0.35"))
+WEIGHT_PARTIAL_RATIO: float = float(os.environ.get("WEIGHT_PARTIAL_RATIO", "0.25"))
+WEIGHT_TOKEN_SET: float = float(os.environ.get("WEIGHT_TOKEN_SET", "0.25"))
+WEIGHT_PARTIAL_TOKEN_SET: float = float(os.environ.get("WEIGHT_PARTIAL_TOKEN_SET", "0.1"))
+WEIGHT_NGRAM_JACCARD: float = float(os.environ.get("WEIGHT_NGRAM_JACCARD", "0.05"))
+NGRAM_N: int = int(os.environ.get("NGRAM_N", "2"))
 
 # Initialize logging
 logging.basicConfig(
@@ -104,8 +112,17 @@ def save_database(db: List[Dict[str, Any]]) -> None:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
 
+def to_simplified(text: str) -> str:
+    try:
+        return HanziConv.toSimplified(text)
+    except Exception:
+        return text
+
+
 def normalize_text(text: str) -> str:
-    """Keep CJK, letters, and digits; remove spaces and punctuation for robust matching."""
+    """Convert to simplified Chinese, lowercase, keep CJK, letters, digits."""
+    text = to_simplified(text)
+    text = text.lower()
     normalized_chars: List[str] = []
     for ch in text:
         if ("\u4e00" <= ch <= "\u9fff") or ch.isalnum():
@@ -113,21 +130,54 @@ def normalize_text(text: str) -> str:
     return "".join(normalized_chars)
 
 
+def tokenize_chinese(text: str) -> List[str]:
+    # Use jieba to tokenize; keep tokens that are CJK or alphanumeric
+    tokens = jieba.lcut(text)
+    filtered: List[str] = []
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+        if any("\u4e00" <= ch <= "\u9fff" for ch in tok) or any(c.isalnum() for c in tok):
+            filtered.append(tok)
+    return filtered
+
+
+def tokens_to_string(tokens: List[str]) -> str:
+    # Join tokens with spaces for token-based fuzzy matching
+    return " ".join(tokens)
+
+
+def ngram_set(text: str, n: int = 2) -> set:
+    if n <= 0:
+        n = 2
+    if len(text) < n:
+        return {text} if text else set()
+    return {text[i : i + n] for i in range(len(text) - n + 1)}
+
+
+def jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
 def preprocess_variants_full(image_bgr: np.ndarray) -> List[np.ndarray]:
     """Generate multiple preprocessing variants of the full image for OCR."""
     variants: List[np.ndarray] = []
 
-    # original
     if "original" in OCR_VARIANTS:
         variants.append(image_bgr)
 
-    # grayscale + Otsu
     if "gray_otsu" in OCR_VARIANTS:
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
         variants.append(th)
 
-    # CLAHE on V channel from HSV, then grayscale + Otsu
     if "clahe_v" in OCR_VARIANTS:
         hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
         h, s, v = cv2.split(hsv)
@@ -139,14 +189,12 @@ def preprocess_variants_full(image_bgr: np.ndarray) -> List[np.ndarray]:
         _, th2 = cv2.threshold(gray2, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
         variants.append(th2)
 
-    # bilateral filter to reduce noise + Otsu
     if "bilateral_otsu" in OCR_VARIANTS:
         bf = cv2.bilateralFilter(image_bgr, d=9, sigmaColor=75, sigmaSpace=75)
         gray3 = cv2.cvtColor(bf, cv2.COLOR_BGR2GRAY)
         _, th3 = cv2.threshold(gray3, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
         variants.append(th3)
 
-    # adaptive threshold
     if "adaptive" in OCR_VARIANTS:
         gray4 = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         th4 = cv2.adaptiveThreshold(
@@ -221,12 +269,49 @@ def extract_text_from_image(image_path: str) -> str:
     if not candidates:
         return ""
 
-    # Prefer the text with most CJK characters, then longest
     def cjk_count(s: str) -> int:
         return sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
 
     best = max(candidates, key=lambda s: (cjk_count(s), len(s)))
     return best
+
+
+def compute_similarity(query_text: str, candidate_text: str) -> int:
+    """Compute a weighted similarity score (0-100) combining multiple fuzzy metrics and n-gram Jaccard."""
+    q_simpl = to_simplified(query_text)
+    c_simpl = to_simplified(candidate_text)
+
+    q_norm = normalize_text(q_simpl)
+    c_norm = normalize_text(c_simpl)
+
+    # Character-level metrics
+    char_ratio = fuzz.ratio(q_norm, c_norm)
+    char_partial = fuzz.partial_ratio(q_norm, c_norm)
+
+    # Token-level metrics
+    q_tokens = tokens_to_string(tokenize_chinese(q_simpl))
+    c_tokens = tokens_to_string(tokenize_chinese(c_simpl))
+    token_set = fuzz.token_set_ratio(q_tokens, c_tokens)
+    token_partial_set = fuzz.partial_token_set_ratio(q_tokens, c_tokens)
+
+    # N-gram Jaccard over normalized string
+    q_ngrams = ngram_set(q_norm, NGRAM_N)
+    c_ngrams = ngram_set(c_norm, NGRAM_N)
+    jac = jaccard(q_ngrams, c_ngrams)
+    jac_score = int(round(jac * 100))
+
+    # Weighted score
+    weighted = (
+        WEIGHT_CHAR_RATIO * char_ratio
+        + WEIGHT_PARTIAL_RATIO * char_partial
+        + WEIGHT_TOKEN_SET * token_set
+        + WEIGHT_PARTIAL_TOKEN_SET * token_partial_set
+        + WEIGHT_NGRAM_JACCARD * jac_score
+    )
+
+    # Clamp and return as int
+    score = int(round(min(100.0, max(0.0, weighted))))
+    return score
 
 
 def add_entry_to_db(image_path: str, text: str) -> None:
@@ -241,22 +326,17 @@ def add_entry_to_db(image_path: str, text: str) -> None:
 
 
 def find_best_match(query_text: str) -> Tuple[Optional[Dict[str, Any]], int]:
-    """Return (best_entry, best_score) using normalized fuzzy similarity."""
+    """Return (best_entry, best_score) using multi-metric weighted similarity."""
     db = load_database()
     if not db:
         return None, 0
 
-    query_norm = normalize_text(query_text)
     best_entry: Optional[Dict[str, Any]] = None
     best_score: int = -1
 
     for entry in db:
         candidate_text = entry.get("text", "") or ""
-        candidate_norm = normalize_text(candidate_text)
-        score = max(
-            fuzz.ratio(query_norm, candidate_norm),
-            fuzz.partial_ratio(query_norm, candidate_norm),
-        )
+        score = compute_similarity(query_text, candidate_text)
         if score > best_score:
             best_score = score
             best_entry = entry
