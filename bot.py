@@ -35,12 +35,15 @@ import jieba
 from hanziconv import HanziConv
 from fuzzywuzzy import fuzz
 from telegram import Update
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
     filters,
 )
 
@@ -51,6 +54,18 @@ from telegram.ext import (
 BOT_TOKEN: str = "8217318799:AAF6SEzDub4f3QK7P5p76QL4uBMwalqI7WY"
 # Replace with your numeric Telegram user ID
 ADMIN_ID: int = 123456789
+
+# Moderators: comma-separated IDs via env, includes ADMIN by default
+MODERATOR_IDS: set = {ADMIN_ID}
+_env_mods = os.environ.get("MODERATOR_IDS", "").strip()
+if _env_mods:
+    try:
+        for part in _env_mods.split(','):
+            part = part.strip()
+            if part:
+                MODERATOR_IDS.add(int(part))
+    except Exception:
+        pass
 
 # Cloud OCR config (OCR.space)
 OCR_API_KEY: str = os.environ.get("OCR_API_KEY", "K88956884888957")
@@ -78,6 +93,7 @@ BOTTOM_RATIO = float(os.environ.get("BOTTOM_RATIO", "0.3"))  # bottom 30% band
 # Storage paths
 IMAGES_DIR: str = "images"
 DB_PATH: str = "database.json"
+TEXT_REPLIES_DB_PATH: str = "text_replies.json"
 
 # Similarity thresholds and weights
 SIMILARITY_THRESHOLD: int = int(os.environ.get("SIMILARITY_THRESHOLD", "80"))
@@ -107,6 +123,9 @@ def ensure_storage() -> None:
     if not os.path.isfile(DB_PATH):
         with open(DB_PATH, "w", encoding="utf-8") as f:
             json.dump([], f, ensure_ascii=False, indent=2)
+    if not os.path.isfile(TEXT_REPLIES_DB_PATH):
+        with open(TEXT_REPLIES_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
 
 
 def load_database() -> List[Dict[str, Any]]:
@@ -119,6 +138,18 @@ def load_database() -> List[Dict[str, Any]]:
 
 def save_database(db: List[Dict[str, Any]]) -> None:
     with open(DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+
+def load_text_replies() -> List[Dict[str, Any]]:
+    try:
+        with open(TEXT_REPLIES_DB_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_text_replies(db: List[Dict[str, Any]]) -> None:
+    with open(TEXT_REPLIES_DB_PATH, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
 
@@ -500,6 +531,17 @@ def add_entry_to_db(image_path: str, text: str) -> None:
     save_database(db)
 
 
+def add_text_reply_to_db(trigger_text: str, reply_image_path: str) -> None:
+    db = load_text_replies()
+    entry = {
+        "text": trigger_text,
+        "reply_image_path": reply_image_path,
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    db.append(entry)
+    save_text_replies(db)
+
+
 def find_best_match(query_text: str) -> Tuple[Optional[Dict[str, Any]], int, int]:
     """Return (best_entry, best_similarity_score, best_token_overlap).
     Accept if token overlap >= 1 or similarity >= SIMILARITY_THRESHOLD.
@@ -536,6 +578,32 @@ def find_best_match(query_text: str) -> Tuple[Optional[Dict[str, Any]], int, int
     return best_sim_entry, best_sim_score, max(0, best_tok_overlap)
 
 
+def find_best_text_reply(query_text: str) -> Tuple[Optional[Dict[str, Any]], int, int]:
+    """Search text_replies for the best match. Return (entry, sim_score, token_overlap)."""
+    db = load_text_replies()
+    if not db:
+        return None, 0, 0
+    query_tokens = build_token_set(query_text)
+    best_sim_entry: Optional[Dict[str, Any]] = None
+    best_sim_score: int = -1
+    best_tok_entry: Optional[Dict[str, Any]] = None
+    best_tok_overlap: int = -1
+    for entry in db:
+        candidate_text = entry.get("text", "") or ""
+        sim_score = compute_similarity(query_text, candidate_text)
+        if sim_score > best_sim_score:
+            best_sim_score = sim_score
+            best_sim_entry = entry
+        entry_tokens = build_token_set(candidate_text)
+        overlap = len(query_tokens & entry_tokens)
+        if overlap > best_tok_overlap:
+            best_tok_overlap = overlap
+            best_tok_entry = entry
+    if best_tok_entry and best_tok_overlap >= 1:
+        return best_tok_entry, best_sim_score, best_tok_overlap
+    return best_sim_entry, best_sim_score, max(0, best_tok_overlap)
+
+
 async def download_photo_as_file(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -559,6 +627,10 @@ def is_admin(user_id: Optional[int]) -> bool:
     return user_id is not None and int(user_id) == int(ADMIN_ID)
 
 
+def is_moderator(user_id: Optional[int]) -> bool:
+    return user_id is not None and int(user_id) in MODERATOR_IDS
+
+
 # =====================
 # Handlers
 # =====================
@@ -567,6 +639,91 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Send a photo containing yellow Chinese text. Admin can add reference images using /add."
     )
+
+
+# ============== Moderator UI (Add Text → Reply Image) ==============
+MANAGE_ADD_TEXT, MANAGE_WAIT_TEXT, MANAGE_WAIT_PHOTO = range(3)
+
+async def manage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if not is_moderator(user.id):
+        await update.message.reply_text("Only moderators can use this.")
+        return ConversationHandler.END
+    kb = [[InlineKeyboardButton(text="Add Text Reply", callback_data="add_text_reply")]]
+    await update.message.reply_text(
+        "Moderator panel:", reply_markup=InlineKeyboardMarkup(kb)
+    )
+    return MANAGE_ADD_TEXT
+
+async def manage_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    user = update.effective_user
+    await query.answer()
+    if not is_moderator(user.id):
+        await query.edit_message_text("Only moderators can use this.")
+        return ConversationHandler.END
+    if query.data == "add_text_reply":
+        await query.edit_message_text("Send the Chinese trigger text to match (yellow text from customer images).")
+        return MANAGE_WAIT_TEXT
+    return ConversationHandler.END
+
+async def manage_capture_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if not is_moderator(user.id):
+        await update.message.reply_text("Only moderators can use this.")
+        return ConversationHandler.END
+    trigger_text = (update.message.text or "").strip()
+    if not trigger_text:
+        await update.message.reply_text("Please send non-empty text.")
+        return MANAGE_WAIT_TEXT
+    context.user_data["trigger_text"] = trigger_text
+    await update.message.reply_text("Now send the reply image (as photo or image document).")
+    return MANAGE_WAIT_PHOTO
+
+async def manage_capture_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if not is_moderator(user.id):
+        await update.message.reply_text("Only moderators can use this.")
+        return ConversationHandler.END
+    trigger_text = context.user_data.get("trigger_text", "").strip()
+    if not trigger_text:
+        await update.message.reply_text("No trigger text found. Start again with /manage.")
+        return ConversationHandler.END
+
+    local_path: Optional[str] = None
+    if update.message.photo:
+        largest = update.message.photo[-1]
+        local_path = await download_photo_as_file(update, context, IMAGES_DIR, largest.file_id, fallback_suffix="_reply")
+    elif update.message.document:
+        doc = update.message.document
+        if (doc.mime_type or "").lower().startswith("image/"):
+            try:
+                telegram_file = await context.bot.get_file(doc.file_id)
+                local_path = os.path.join(IMAGES_DIR, f"{int(time.time())}_{doc.file_unique_id}_reply")
+                ext = ".jpg"
+                mime = (doc.mime_type or "").lower()
+                if "/png" in mime:
+                    ext = ".png"
+                elif "/jpeg" in mime or "/jpg" in mime:
+                    ext = ".jpg"
+                local_path = local_path + ext
+                await telegram_file.download_to_drive(custom_path=local_path)
+            except Exception as e:
+                logger.exception("Failed to download reply document: %s", e)
+                local_path = None
+    if not local_path:
+        await update.message.reply_text("Please send a valid image.")
+        return MANAGE_WAIT_PHOTO
+
+    add_text_reply_to_db(trigger_text, local_path)
+    await update.message.reply_text("Saved text reply mapping.")
+    context.user_data.pop("trigger_text", None)
+    return ConversationHandler.END
+
+async def manage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("trigger_text", None)
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
 
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -647,6 +804,23 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     query_text = extract_text_for_query(tmp_path)
+    # First try text-reply mappings
+    best_reply_entry, reply_score, reply_overlap = find_best_text_reply(query_text)
+    if best_reply_entry and (reply_overlap >= 1 or reply_score >= SIMILARITY_THRESHOLD):
+        reply_path = best_reply_entry.get("reply_image_path")
+        if reply_path and os.path.isfile(reply_path):
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
+            try:
+                with open(reply_path, "rb") as f:
+                    cap = f"Reply {'word overlap' if reply_overlap>=1 else str(reply_score)+'%'}"
+                    await message.reply_photo(photo=f, caption=cap)
+            except Exception as e:
+                logger.exception("Failed to send reply image: %s", e)
+        else:
+            logger.warning("Reply image missing at path: %s", reply_path)
+            await message.reply_text("Sorry, reply image missing.")
+        return
+    # Else fallback to image DB
     best_entry, best_score, best_overlap = find_best_match(query_text)
 
     logger.info("Query text: %s | Best score: %s | Overlap: %s", query_text, best_score, best_overlap)
@@ -728,6 +902,21 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     query_text = extract_text_for_query(local_path)
+    best_reply_entry, reply_score, reply_overlap = find_best_text_reply(query_text)
+    if best_reply_entry and (reply_overlap >= 1 or reply_score >= SIMILARITY_THRESHOLD):
+        reply_path = best_reply_entry.get("reply_image_path")
+        if reply_path and os.path.isfile(reply_path):
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
+            try:
+                with open(reply_path, "rb") as f:
+                    cap = f"Reply {'word overlap' if reply_overlap>=1 else str(reply_score)+'%'}"
+                    await message.reply_photo(photo=f, caption=cap)
+            except Exception as e:
+                logger.exception("Failed to send reply image: %s", e)
+        else:
+            logger.warning("Reply image missing at path: %s", reply_path)
+            await message.reply_text("Sorry, reply image missing.")
+        return
     best_entry, best_score, best_overlap = find_best_match(query_text)
 
     if best_entry and (best_overlap >= 1 or best_score >= SIMILARITY_THRESHOLD):
@@ -757,6 +946,19 @@ def main() -> None:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    # Moderator manage flow
+    manage_conv = ConversationHandler(
+        entry_points=[CommandHandler("manage", manage)],
+        states={
+            MANAGE_ADD_TEXT: [CallbackQueryHandler(manage_cb)],
+            MANAGE_WAIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, manage_capture_text)],
+            MANAGE_WAIT_PHOTO: [MessageHandler((filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND, manage_capture_photo)],
+        },
+        fallbacks=[CommandHandler("cancel", manage_cancel)],
+        name="manage_conv",
+        persistent=False,
+    )
+    app.add_handler(manage_conv)
     app.add_handler(CommandHandler("add", add_command))
 
     # Photos with or without caption
