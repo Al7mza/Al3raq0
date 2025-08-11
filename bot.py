@@ -79,6 +79,10 @@ OCR_VARIANTS: List[str] = [
     "clahe_v",
     "bilateral_otsu",
     "adaptive",
+    "canny",
+    "morph_close",
+    "sobelx",
+    "scharr",
 ]
 
 # Yellow detection HSV bounds (tunable via env)
@@ -297,6 +301,35 @@ def preprocess_variants_full(image_bgr: np.ndarray) -> List[np.ndarray]:
         )
         variants.append(th4)
 
+    if "canny" in OCR_VARIANTS:
+        gray5 = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray5, 80, 160)
+        # thicken edges
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        edges = cv2.dilate(edges, kernel, iterations=1)
+        variants.append(edges)
+
+    if "morph_close" in OCR_VARIANTS:
+        gray6 = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        _, th6 = cv2.threshold(gray6, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        closed = cv2.morphologyEx(th6, cv2.MORPH_CLOSE, kernel, iterations=1)
+        variants.append(closed)
+
+    if "sobelx" in OCR_VARIANTS:
+        gray7 = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        sx = cv2.Sobel(gray7, cv2.CV_16S, 1, 0)
+        sx = cv2.convertScaleAbs(sx)
+        _, th7 = cv2.threshold(sx, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        variants.append(th7)
+
+    if "scharr" in OCR_VARIANTS:
+        gray8 = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        sch = cv2.Scharr(gray8, cv2.CV_16S, 1, 0)
+        sch = cv2.convertScaleAbs(sch)
+        _, th8 = cv2.threshold(sch, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        variants.append(th8)
+
     return variants
 
 
@@ -464,14 +497,33 @@ def extract_bottom_yellow_text(image_path: str) -> str:
 
 
 def extract_text_for_add(image_path: str) -> str:
-    """Admin add: prefer bottom yellow text; fallback to full yellow; then full-image variants."""
-    text = extract_bottom_yellow_text(image_path)
-    if text:
-        return text
-    text = extract_yellow_text(image_path)
-    if text:
-        return text
-    return extract_text_from_image(image_path)
+    """Admin add: prefer robust full-image OCR; also consider yellow/bottom as hints.
+    Pick the best text among candidates regardless of color.
+    """
+    # Try full-image variants first
+    image = cv2.imread(image_path)
+    candidates: List[str] = []
+    calls = 0
+    if image is not None:
+        for variant in preprocess_variants_full(image):
+            if calls >= MAX_OCR_CALLS:
+                break
+            t = ocr_with_cloud(variant)
+            calls += 1
+            if t:
+                candidates.append(t)
+                if count_cjk(t) >= 4:
+                    break
+    # Add yellow pipelines as additional candidates
+    y1 = extract_bottom_yellow_text(image_path)
+    if y1:
+        candidates.append(y1)
+    y2 = extract_yellow_text(image_path)
+    if y2:
+        candidates.append(y2)
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda s: (count_cjk(s), len(s)))
 
 
 def extract_text_for_query(image_path: str) -> str:
@@ -649,7 +701,10 @@ async def manage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_moderator(user.id):
         await update.message.reply_text("Only moderators can use this.")
         return ConversationHandler.END
-    kb = [[InlineKeyboardButton(text="Add Text Reply", callback_data="add_text_reply")]]
+    kb = [
+        [InlineKeyboardButton(text="Add Text Reply", callback_data="add_text_reply")],
+        [InlineKeyboardButton(text="Cancel", callback_data="cancel_manage")],
+    ]
     await update.message.reply_text(
         "Moderator panel:", reply_markup=InlineKeyboardMarkup(kb)
     )
@@ -663,8 +718,11 @@ async def manage_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.edit_message_text("Only moderators can use this.")
         return ConversationHandler.END
     if query.data == "add_text_reply":
-        await query.edit_message_text("Send the Chinese trigger text to match (yellow text from customer images).")
+        await query.edit_message_text("Send the Chinese trigger text to match (yellow or any text from customer images).")
         return MANAGE_WAIT_TEXT
+    if query.data == "cancel_manage":
+        await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END
     return ConversationHandler.END
 
 async def manage_capture_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -724,6 +782,15 @@ async def manage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data.pop("trigger_text", None)
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
+
+# Shortcut command to jump straight into adding mapping
+async def addmapping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_moderator(user.id):
+        await update.message.reply_text("Only moderators can use this.")
+        return
+    kb = [[InlineKeyboardButton(text="Add Text Reply", callback_data="add_text_reply")]]
+    await update.message.reply_text("Click to add a text→image mapping:", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -959,6 +1026,7 @@ def main() -> None:
         persistent=False,
     )
     app.add_handler(manage_conv)
+    app.add_handler(CommandHandler("addmapping", addmapping))
     app.add_handler(CommandHandler("add", add_command))
 
     # Photos with or without caption
