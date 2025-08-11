@@ -109,6 +109,10 @@ WEIGHT_NGRAM_JACCARD: float = float(os.environ.get("WEIGHT_NGRAM_JACCARD", "0.05
 NGRAM_N: int = int(os.environ.get("NGRAM_N", "2"))
 MAX_OCR_CALLS: int = int(os.environ.get("MAX_OCR_CALLS", "24"))
 
+# Overlap acceptance
+MIN_TOKEN_OVERLAP: int = int(os.environ.get("MIN_TOKEN_OVERLAP", "1"))
+MIN_SIMILARITY_FALLBACK: int = int(os.environ.get("MIN_SIMILARITY_FALLBACK", "70"))
+
 # Initialize logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -576,9 +580,13 @@ def compute_similarity(query_text: str, candidate_text: str) -> int:
 
 def add_entry_to_db(image_path: str, text: str) -> None:
     db = load_database()
+    norm_text = normalize_text(text)
+    tokens = sorted(list(build_token_set(text))) if text else []
     entry = {
         "image_path": image_path,
         "text": text,
+        "norm_text": norm_text,
+        "tokens": tokens,
         "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
     db.append(entry)
@@ -587,8 +595,12 @@ def add_entry_to_db(image_path: str, text: str) -> None:
 
 def add_text_reply_to_db(trigger_text: str, reply_image_path: str) -> None:
     db = load_text_replies()
+    norm_text = normalize_text(trigger_text)
+    tokens = sorted(list(build_token_set(trigger_text))) if trigger_text else []
     entry = {
         "text": trigger_text,
+        "norm_text": norm_text,
+        "tokens": tokens,
         "reply_image_path": reply_image_path,
         "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
@@ -598,38 +610,41 @@ def add_text_reply_to_db(trigger_text: str, reply_image_path: str) -> None:
 
 def find_best_match(query_text: str) -> Tuple[Optional[Dict[str, Any]], int, int]:
     """Return (best_entry, best_similarity_score, best_token_overlap).
-    Accept if token overlap >= 1 or similarity >= SIMILARITY_THRESHOLD.
+    Accept if token overlap >= MIN_TOKEN_OVERLAP or similarity >= SIMILARITY_THRESHOLD.
     """
     db = load_database()
     if not db:
         return None, 0, 0
 
     query_tokens = build_token_set(query_text)
+    query_norm = normalize_text(query_text)
 
-    best_sim_entry: Optional[Dict[str, Any]] = None
+    best_entry: Optional[Dict[str, Any]] = None
     best_sim_score: int = -1
-
-    best_tok_entry: Optional[Dict[str, Any]] = None
     best_tok_overlap: int = -1
+    best_overall_score: float = -1.0
 
     for entry in db:
         candidate_text = entry.get("text", "") or ""
-        # similarity
-        sim_score = compute_similarity(query_text, candidate_text)
-        if sim_score > best_sim_score:
-            best_sim_score = sim_score
-            best_sim_entry = entry
-        # token overlap
-        entry_tokens = build_token_set(candidate_text)
-        overlap = len(query_tokens & entry_tokens)
-        if overlap > best_tok_overlap:
-            best_tok_overlap = overlap
-            best_tok_entry = entry
+        candidate_norm = entry.get("norm_text") or normalize_text(candidate_text)
+        entry_tokens = set(entry.get("tokens") or build_token_set(candidate_text))
 
-    # Prefer token overlap if exists, else similarity
-    if best_tok_entry and best_tok_overlap >= 1:
-        return best_tok_entry, best_sim_score, best_tok_overlap
-    return best_sim_entry, best_sim_score, max(0, best_tok_overlap)
+        # token overlap
+        overlap = len(query_tokens & entry_tokens)
+
+        # weighted similarity
+        sim_score = compute_similarity(query_text, candidate_text)
+
+        # overall ranking score prioritizing overlap then similarity
+        overall = overlap * 100 + sim_score
+
+        if overall > best_overall_score:
+            best_overall_score = overall
+            best_entry = entry
+            best_sim_score = sim_score
+            best_tok_overlap = overlap
+
+    return best_entry, best_sim_score if best_entry else 0, max(0, best_tok_overlap)
 
 
 def find_best_text_reply(query_text: str) -> Tuple[Optional[Dict[str, Any]], int, int]:
@@ -638,24 +653,24 @@ def find_best_text_reply(query_text: str) -> Tuple[Optional[Dict[str, Any]], int
     if not db:
         return None, 0, 0
     query_tokens = build_token_set(query_text)
-    best_sim_entry: Optional[Dict[str, Any]] = None
+
+    best_entry: Optional[Dict[str, Any]] = None
     best_sim_score: int = -1
-    best_tok_entry: Optional[Dict[str, Any]] = None
     best_tok_overlap: int = -1
+    best_overall_score: float = -1.0
+
     for entry in db:
         candidate_text = entry.get("text", "") or ""
-        sim_score = compute_similarity(query_text, candidate_text)
-        if sim_score > best_sim_score:
-            best_sim_score = sim_score
-            best_sim_entry = entry
-        entry_tokens = build_token_set(candidate_text)
+        entry_tokens = set(entry.get("tokens") or build_token_set(candidate_text))
         overlap = len(query_tokens & entry_tokens)
-        if overlap > best_tok_overlap:
+        sim_score = compute_similarity(query_text, candidate_text)
+        overall = overlap * 100 + sim_score
+        if overall > best_overall_score:
+            best_overall_score = overall
+            best_entry = entry
+            best_sim_score = sim_score
             best_tok_overlap = overlap
-            best_tok_entry = entry
-    if best_tok_entry and best_tok_overlap >= 1:
-        return best_tok_entry, best_sim_score, best_tok_overlap
-    return best_sim_entry, best_sim_score, max(0, best_tok_overlap)
+    return best_entry, best_sim_score if best_entry else 0, max(0, best_tok_overlap)
 
 
 async def download_photo_as_file(
@@ -818,7 +833,11 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not local_path:
             await message.reply_text("Failed to download the photo.")
             return
-        text = extract_text_for_add(local_path)
+        try:
+            text = extract_text_for_add(local_path)
+        except Exception as e:
+            logger.exception("Add OCR failed: %s", e)
+            text = ""
         add_entry_to_db(local_path, text)
         await message.reply_text("Added image to database.")
         return
@@ -881,13 +900,13 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     # First try text-reply mappings
     best_reply_entry, reply_score, reply_overlap = find_best_text_reply(query_text)
-    if best_reply_entry and (reply_overlap >= 1 or reply_score >= SIMILARITY_THRESHOLD):
+    if best_reply_entry and (reply_overlap >= MIN_TOKEN_OVERLAP or reply_score >= SIMILARITY_THRESHOLD):
         reply_path = best_reply_entry.get("reply_image_path")
         if reply_path and os.path.isfile(reply_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
                 with open(reply_path, "rb") as f:
-                    cap = f"Reply {'word overlap' if reply_overlap>=1 else str(reply_score)+'%'}"
+                    cap = f"Reply {'word overlap' if reply_overlap>=MIN_TOKEN_OVERLAP else str(reply_score)+'%'}"
                     await message.reply_photo(photo=f, caption=cap)
             except Exception as e:
                 logger.exception("Failed to send reply image: %s", e)
@@ -900,13 +919,13 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     logger.info("Query text: %s | Best score: %s | Overlap: %s", query_text, best_score, best_overlap)
 
-    if best_entry and (best_overlap >= 1 or best_score >= SIMILARITY_THRESHOLD):
+    if best_entry and (best_overlap >= MIN_TOKEN_OVERLAP or best_score >= SIMILARITY_THRESHOLD or (best_score >= MIN_SIMILARITY_FALLBACK and best_overlap >= 0)):
         image_path = best_entry.get("image_path")
         if image_path and os.path.isfile(image_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
                 with open(image_path, "rb") as f:
-                    cap = f"Match {'word overlap' if best_overlap>=1 else str(best_score)+'%'}"
+                    cap = f"Match {'word overlap' if best_overlap>=MIN_TOKEN_OVERLAP else str(best_score)+'%'}"
                     await message.reply_photo(photo=f, caption=cap)
             except Exception as e:
                 logger.exception("Failed to send matched image: %s", e)
@@ -987,13 +1006,13 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("Sorry, OCR failed. Please try another image or later.")
         return
     best_reply_entry, reply_score, reply_overlap = find_best_text_reply(query_text)
-    if best_reply_entry and (reply_overlap >= 1 or reply_score >= SIMILARITY_THRESHOLD):
+    if best_reply_entry and (reply_overlap >= MIN_TOKEN_OVERLAP or reply_score >= SIMILARITY_THRESHOLD):
         reply_path = best_reply_entry.get("reply_image_path")
         if reply_path and os.path.isfile(reply_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
                 with open(reply_path, "rb") as f:
-                    cap = f"Reply {'word overlap' if reply_overlap>=1 else str(reply_score)+'%'}"
+                    cap = f"Reply {'word overlap' if reply_overlap>=MIN_TOKEN_OVERLAP else str(reply_score)+'%'}"
                     await message.reply_photo(photo=f, caption=cap)
             except Exception as e:
                 logger.exception("Failed to send reply image: %s", e)
@@ -1003,13 +1022,13 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     best_entry, best_score, best_overlap = find_best_match(query_text)
 
-    if best_entry and (best_overlap >= 1 or best_score >= SIMILARITY_THRESHOLD):
+    if best_entry and (best_overlap >= MIN_TOKEN_OVERLAP or best_score >= SIMILARITY_THRESHOLD or (best_score >= MIN_SIMILARITY_FALLBACK and best_overlap >= 0)):
         image_path = best_entry.get("image_path")
         if image_path and os.path.isfile(image_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
                 with open(image_path, "rb") as f:
-                    cap = f"Match {'word overlap' if best_overlap>=1 else str(best_score)+'%'}"
+                    cap = f"Match {'word overlap' if best_overlap>=MIN_TOKEN_OVERLAP else str(best_score)+'%'}"
                     await message.reply_photo(photo=f, caption=cap)
             except Exception as e:
                 logger.exception("Failed to send matched image: %s", e)
@@ -1045,16 +1064,63 @@ async def add_dollar_plus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await message.reply_text("Added image to database.")
 
 
+# Admin utility to rebuild missing/weak texts in DB
+async def rebuild_db(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Only the administrator can use /rebuild.")
+        return
+    await update.message.reply_text("Rebuilding OCR text for stored images. This may take a while...")
+    db = load_database()
+    changed = 0
+    for entry in db:
+        text = entry.get("text", "")
+        if count_cjk(text) >= 2:
+            # also refresh derived fields
+            entry["norm_text"] = normalize_text(text)
+            entry["tokens"] = sorted(list(build_token_set(text)))
+            continue
+        image_path = entry.get("image_path")
+        if image_path and os.path.isfile(image_path):
+            try:
+                new_text = extract_text_for_add(image_path)
+                entry["text"] = new_text
+                entry["norm_text"] = normalize_text(new_text)
+                entry["tokens"] = sorted(list(build_token_set(new_text)))
+                changed += 1
+            except Exception as e:
+                logger.exception("Rebuild OCR failed for %s: %s", image_path, e)
+    save_database(db)
+    await update.message.reply_text(f"Rebuild complete. Updated {changed} entries.")
+
+# Refresh at startup for entries with missing derived fields
+def refresh_database_texts_on_startup() -> None:
+    db = load_database()
+    updated = False
+    for entry in db:
+        text = entry.get("text", "")
+        if "norm_text" not in entry:
+            entry["norm_text"] = normalize_text(text)
+            updated = True
+        if "tokens" not in entry:
+            entry["tokens"] = sorted(list(build_token_set(text))) if text else []
+            updated = True
+    if updated:
+        save_database(db)
+
+
 # =====================
 # App bootstrap
 # =====================
 
 def main() -> None:
     ensure_storage()
+    refresh_database_texts_on_startup()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("rebuild", rebuild_db))
     # Moderator manage flow
     manage_conv = ConversationHandler(
         entry_points=[CommandHandler("manage", manage)],
