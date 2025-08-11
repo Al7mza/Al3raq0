@@ -2,14 +2,20 @@
 """
 Telegram bot that:
 - Admin can add reference images via /add (attached as photo or by replying /add to a photo).
-- Any user can send a photo; the bot extracts yellow Chinese text using OpenCV + EasyOCR,
+- Any user can send a photo; the bot extracts yellow Chinese text using OpenCV OCR pipeline,
   compares it with stored entries (FuzzyWuzzy), and returns the best matched reference image
   if similarity >= 80, otherwise replies that no match was found.
 
+OCR backends:
+- EasyOCR (default, requires PyTorch; heavy)
+- Tesseract fallback (lightweight). To force Tesseract, set env USE_TESSERACT=1 and install
+  system packages: tesseract-ocr tesseract-ocr-chi-sim
+
 Dependencies:
 - python-telegram-bot >= 20
-- opencv-python
-- easyocr
+- opencv-python (or opencv-python-headless)
+- easyocr (optional if using Tesseract)
+- pytesseract (optional, for Tesseract fallback)
 - fuzzywuzzy (optional: python-Levenshtein for speed)
 
 Run:
@@ -26,7 +32,26 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import easyocr
+
+# OCR backend selection
+USE_TESSERACT_ENV = os.environ.get("USE_TESSERACT", "0") == "1"
+
+EASYOCR_AVAILABLE = False
+PYTESSERACT_AVAILABLE = False
+
+try:
+    if not USE_TESSERACT_ENV:
+        import easyocr  # type: ignore
+        EASYOCR_AVAILABLE = True
+except Exception:
+    EASYOCR_AVAILABLE = False
+
+try:
+    import pytesseract  # type: ignore
+    PYTESSERACT_AVAILABLE = True
+except Exception:
+    PYTESSERACT_AVAILABLE = False
+
 from fuzzywuzzy import fuzz
 from telegram import Update
 from telegram.constants import ChatAction
@@ -60,9 +85,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize EasyOCR reader once (Chinese simplified + English)
+# Initialize EasyOCR reader if available (Chinese simplified + English)
 # GPU=False is safer on most servers; set to True if you have GPU with proper drivers
-OCR_READER = easyocr.Reader(["ch_sim", "en"], gpu=False)
+OCR_READER = None
+OCR_BACKEND = "tesseract" if USE_TESSERACT_ENV else ("easyocr" if EASYOCR_AVAILABLE else ("tesseract" if PYTESSERACT_AVAILABLE else "none"))
+if OCR_BACKEND == "easyocr":
+    try:
+        OCR_READER = easyocr.Reader(["ch_sim", "en"], gpu=False)  # type: ignore
+    except Exception as init_err:
+        logger.warning("Falling back to Tesseract due to EasyOCR init error: %s", init_err)
+        OCR_BACKEND = "tesseract" if PYTESSERACT_AVAILABLE else "none"
 
 
 # =====================
@@ -104,8 +136,23 @@ def yellow_mask_bgr(image_bgr: np.ndarray) -> np.ndarray:
     return mask
 
 
+def ocr_with_easyocr(image_np: np.ndarray) -> str:
+    results = OCR_READER.readtext(image_np, detail=0, paragraph=True)  # type: ignore
+    return " ".join([r.strip() for r in results if isinstance(r, str) and r.strip()])
+
+
+def ocr_with_tesseract(image_np: np.ndarray) -> str:
+    # Use Chinese Simplified; make sure tesseract-ocr-chi-sim is installed on the host
+    try:
+        text = pytesseract.image_to_string(image_np, lang="chi_sim")  # type: ignore
+    except pytesseract.TesseractNotFoundError:  # type: ignore
+        logger.error("Tesseract not found. Install tesseract-ocr and tesseract-ocr-chi-sim.")
+        return ""
+    return " ".join(t.strip() for t in text.split())
+
+
 def extract_text_from_image(image_path: str) -> str:
-    """Extract Chinese text by isolating yellow regions and running EasyOCR."""
+    """Extract Chinese text by isolating yellow regions and running OCR backend."""
     image = cv2.imread(image_path)
     if image is None:
         return ""
@@ -114,17 +161,17 @@ def extract_text_from_image(image_path: str) -> str:
     # Apply mask to original image to keep only yellow areas
     masked = cv2.bitwise_and(image, image, mask=mask)
 
-    # Optional: grayscale + threshold to increase contrast for OCR
+    # Convert to grayscale + threshold to increase contrast for OCR
     gray = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
-    # Use Otsu to binarize; invert so text likely dark on light background if needed
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
-    # EasyOCR can read numpy arrays directly
-    results = OCR_READER.readtext(thresh, detail=0, paragraph=True)
-
-    # Join results; keep as-is (Chinese + possible English)
-    combined_text = " ".join([r.strip() for r in results if isinstance(r, str) and r.strip()])
-    return combined_text
+    if OCR_BACKEND == "easyocr":
+        return ocr_with_easyocr(thresh)
+    elif OCR_BACKEND == "tesseract":
+        return ocr_with_tesseract(thresh)
+    else:
+        logger.error("No OCR backend available. Install EasyOCR or Tesseract + pytesseract.")
+        return ""
 
 
 def add_entry_to_db(image_path: str, text: str) -> None:
@@ -269,7 +316,7 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query_text = extract_text_from_image(tmp_path)
     best_entry, best_score = find_best_match(query_text)
 
-    logger.info("Query text: %s | Best score: %s", query_text, best_score)
+    logger.info("OCR backend: %s | Query text: %s | Best score: %s", OCR_BACKEND, query_text, best_score)
 
     if best_entry and best_score >= SIMILARITY_THRESHOLD:
         image_path = best_entry.get("image_path")
@@ -373,6 +420,9 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def main() -> None:
     ensure_storage()
 
+    if OCR_BACKEND == "none":
+        logger.error("No OCR backend available. Install EasyOCR (heavy) or Tesseract + pytesseract (light).")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -384,7 +434,7 @@ def main() -> None:
     # Images sent as documents
     app.add_handler(MessageHandler(filters.Document.ALL, document_router))
 
-    logger.info("Bot is starting...")
+    logger.info("Bot is starting... Using OCR backend: %s", OCR_BACKEND)
     app.run_polling(close_loop=False)
 
 
