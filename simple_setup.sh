@@ -1,5 +1,5 @@
 #!/bin/bash
-echo "🚀 Setting up ULTIMATE SIMPLE BOT..."
+echo "🚀 Setting up Simple Treasure Map Bot..."
 
 # Check Python
 echo "🔍 Checking Python..."
@@ -15,7 +15,7 @@ mkdir -p uploads
 
 # Make bot executable
 echo "🔧 Making bot executable..."
-chmod +x ULTIMATE_SIMPLE_BOT.py
+chmod +x simple_bot.py
 
 echo "✅ Setup complete!"
-echo "🚀 Run your bot: python3 ULTIMATE_SIMPLE_BOT.py"
+echo "🚀 Run your bot: python3 simple_bot.py"

@@ -1,9 +1,9 @@
-# 🗺️ ULTIMATE SIMPLE BOT
+# 🗺️ Simple Treasure Map Bot
 
 ## 🚀 **JUST COPY-PASTE AND RUN!**
 
 ### **Step 1: Copy the Bot Code**
-Copy the entire content of `ULTIMATE_SIMPLE_BOT.py` and paste it into your hosting file editor.
+Copy the entire content of `simple_bot.py` and paste it into your hosting file editor.
 
 ### **Step 2: Install Dependencies**
 ```bash
@@ -12,7 +12,7 @@ pip3 install python-telegram-bot
 
 ### **Step 3: Run Your Bot**
 ```bash
-python3 ULTIMATE_SIMPLE_BOT.py
+python3 simple_bot.py
 ```
 
 ## 📋 **What This Bot Does**

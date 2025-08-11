@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ULTIMATE SIMPLE BOT - Will work on ANY hosting!
-Just copy-paste this entire file and run it!
+Simple Treasure Map Bot - Easy Hosting Version
+Just copy-paste and run!
 """
 import os
 import sqlite3
@@ -9,11 +9,11 @@ import asyncio
 import logging
 from datetime import datetime
 
-# SUPER SIMPLE LOGGING
+# Simple logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# YOUR BOT CONFIGURATION
+# Your bot configuration
 BOT_TOKEN = '8217318799:AAF6SEzDub4f3QK7P5p76QL4uBMwalqI7WY'
 ADMIN_USER_IDS = [1694244496]
 UPLOAD_FOLDER = 'uploads'
@@ -219,7 +219,7 @@ class SimpleBot:
 async def main():
     """Main function"""
     try:
-        print("🚀 Starting ULTIMATE SIMPLE BOT...")
+        print("🚀 Starting Simple Treasure Map Bot...")
         
         # Create bot instance
         bot = SimpleBot()
@@ -256,5 +256,5 @@ async def main():
         print("🔧 Check your bot token and internet connection")
 
 if __name__ == "__main__":
-    print("🎯 ULTIMATE SIMPLE BOT - Starting...")
+    print("🎯 Simple Treasure Map Bot - Starting...")
     asyncio.run(main())

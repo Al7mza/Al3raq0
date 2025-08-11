@@ -1,137 +1,161 @@
-# 🎯 Treasure Map Bot
+# 🗺️ Treasure Map Bot
 
-A Telegram bot that helps players find matching treasure maps using OCR and text similarity matching.
+A powerful Telegram bot for storing and searching treasure map images with intelligent text matching.
 
-## ✨ Features
+## 🌟 Features
 
-- **OCR Text Extraction**: Automatically extracts text from images using Tesseract
-- **Multi-language Support**: Chinese (Simplified) + English
-- **Smart Text Matching**: Fuzzy text matching with configurable similarity threshold
-- **Admin Panel**: Upload, delete, and manage reference images
-- **User-friendly**: Simple image upload to find matches
+- 📤 **Photo Upload**: Upload treasure map images
+- 🔍 **Smart Search**: Search through maps using text queries
+- 📋 **Map Management**: List all maps and your personal maps
+- 💾 **Database Storage**: SQLite database for reliable data storage
+- 📊 **Search History**: Track search queries and results
+- 🌐 **Arabic Support**: Full Arabic language support
+- 🔧 **Easy Setup**: Simple installation and configuration
 
 ## 🚀 Quick Start
 
-### 1. Setup
+### **Step 1: Download Files**
+Download all bot files to your hosting environment.
+
+### **Step 2: Install Dependencies**
 ```bash
-# Make setup script executable
+# Run setup script
 chmod +x setup.sh
-
-# Run setup (installs dependencies)
 ./setup.sh
+
+# Or install manually
+pip3 install python-telegram-bot
 ```
 
-### 2. Configuration
-Edit `.env` file:
-```env
-BOT_TOKEN=your_bot_token_here
-ADMIN_USER_IDS=your_telegram_user_id
-```
-
-### 3. Test
+### **Step 3: Run Your Bot**
 ```bash
-python3 test_bot.py
+python3 treasure_map_bot.py
 ```
-
-### 4. Run
-```bash
-python3 bot.py
-```
-
-## 🔧 **Python 3.13+ Compatibility**
-
-If you're getting build errors with Python 3.13+, use the simplified version:
-
-```bash
-# Install only essential packages
-pip3 install python-telegram-bot python-dotenv Pillow
-
-# Run simplified bot (Python 3.13+ compatible)
-python3 bot-simple.py
-```
-
-**See `INSTALLATION_GUIDE.md` for detailed troubleshooting!**
 
 ## 📋 Commands
 
-### Admin Commands
-- `/add` - Upload reference images (reply to image)
-- `/delete` - Remove reference images
-- `/list` - Show all stored images
-- `/setthreshold <value>` - Set similarity threshold (1-100%)
+- `/start` - Welcome message and bot introduction
+- `/help` - Help and usage instructions
+- `/search <text>` - Search for maps containing specific text
+- `/list` - Show all uploaded maps
+- `/mymaps` - Show your personal maps
 
-### User Commands
-- Send any image to find matching treasure maps
-- `/help` - Get detailed help
-- `/start` - Welcome message
+## 🔧 Configuration
 
-## 🔧 Requirements
+The bot is pre-configured with your settings:
 
-- Python 3.8+
-- Tesseract OCR
-- System: Ubuntu/Debian (for setup script)
+- **Bot Token**: `8217318799:AAF6SEzDub4f3QK7P5p76QL4uBMwalqI7WY`
+- **Admin ID**: `1694244496`
+- **Google API Key**: `AIzaSyBiW7vLyDMRpcZcWdawzmPXjZqL5rSsl1k`
 
-## 📁 Files
+## 📁 File Structure
 
-- `bot.py` - Main bot application
-- `bot-simple.py` - **Simplified bot for Python 3.13+**
-- `config.py` - Configuration settings
-- `database.py` - Database operations
-- `ocr_handler.py` - OCR text extraction
-- `text_matcher.py` - Text similarity matching
-- `setup.sh` - Automated setup script
-- `test_bot.py` - Component testing
-- `requirements.txt` - Python dependencies
-- `requirements-python313.txt` - **Alternative dependencies for Python 3.13+**
-- `requirements-minimal.txt` - **Minimal dependencies**
-- `INSTALLATION_GUIDE.md` - **Troubleshooting guide**
-
-## 🎯 How It Works
-
-1. **Admin uploads reference images** using `/add` command
-2. **Bot extracts text** from images using OCR
-3. **Users send treasure map images** to find matches
-4. **Bot compares text similarity** and returns best match
-5. **Similarity threshold** determines match quality
-
-## 🔍 Similarity Algorithm
-
-Combines multiple text matching approaches:
-- Fuzzy string matching (Levenshtein distance)
-- Token-based similarity
-- Keyword overlap analysis
-- Configurable weights for optimal results
-
-## 🚨 **Troubleshooting**
-
-### Build Errors (Python 3.13+)
-```bash
-# Use simplified bot instead
-python3 bot-simple.py
-
-# Or install with pre-compiled wheels
-pip3 install --only-binary=all python-telegram-bot python-dotenv Pillow
+```
+treasure-map-bot/
+├── treasure_map_bot.py    # Main bot file
+├── requirements.txt        # Python dependencies
+├── setup.sh              # Setup script
+├── README.md             # This file
+├── uploads/              # Image storage folder
+└── treasure_map.db       # Database (created automatically)
 ```
 
-### Missing Dependencies
-```bash
-# Try alternative requirements
-pip3 install -r requirements-python313.txt
+## 🛠️ Requirements
 
-# Or minimal installation
-pip3 install -r requirements-minimal.txt
+- **Python**: 3.7 or higher
+- **Dependencies**: `python-telegram-bot`
+- **Storage**: At least 100MB free space
+- **Internet**: Stable connection for Telegram API
+
+## 🔍 How It Works
+
+1. **Upload**: Users send treasure map images
+2. **Process**: Bot downloads and stores images locally
+3. **Extract**: Bot generates descriptive text for each image
+4. **Store**: All data saved to SQLite database
+5. **Search**: Users can search through maps using text queries
+6. **Match**: Intelligent text similarity matching finds relevant results
+
+## 📊 Database Schema
+
+### Treasure Maps Table
+- `id`: Unique identifier
+- `user_id`: Telegram user ID
+- `username`: Telegram username
+- `first_name`: User's first name
+- `file_path`: Local file path
+- `file_size`: File size in bytes
+- `text_content`: Extracted/descriptive text
+- `created_at`: Upload timestamp
+
+### Search History Table
+- `id`: Unique identifier
+- `user_id`: User who performed search
+- `query`: Search query text
+- `results_count`: Number of results found
+- `searched_at`: Search timestamp
+
+## 🚨 Troubleshooting
+
+### **Bot Won't Start**
+1. Check Python version: `python3 --version`
+2. Verify dependencies: `pip3 list | grep telegram`
+3. Check bot token validity
+4. Ensure internet connection
+
+### **Photos Not Saving**
+1. Check `uploads/` folder permissions
+2. Verify disk space availability
+3. Check file size limits (10MB max)
+
+### **Search Not Working**
+1. Ensure maps have been uploaded
+2. Check database file exists
+3. Verify text content was generated
+
+### **Permission Errors**
+```bash
+chmod +x setup.sh
+chmod +x treasure_map_bot.py
+chmod 755 uploads/
 ```
 
-### Full Troubleshooting Guide
-See `INSTALLATION_GUIDE.md` for step-by-step solutions!
+## 🔒 Security Features
 
-## 📞 Support
+- File size limits (10MB max)
+- Allowed file extensions only
+- User authentication via Telegram
+- Secure file naming conventions
+- Database injection protection
 
-For issues or questions:
-1. Check `INSTALLATION_GUIDE.md`
-2. Run: `python3 test_bot.py`
-3. Try the simplified bot: `python3 bot-simple.py`
+## 📈 Performance Tips
+
+- Keep image sizes reasonable
+- Use descriptive text for better search
+- Regular database maintenance
+- Monitor disk space usage
+
+## 🤝 Support
+
+If you encounter issues:
+
+1. Check the logs in `bot.log`
+2. Verify all dependencies are installed
+3. Ensure proper file permissions
+4. Check internet connectivity
 
 ## 📝 License
 
 This project is open source and available under the MIT License.
+
+## 🎯 What's Next?
+
+- Add real OCR capabilities
+- Implement image compression
+- Add backup functionality
+- Create web dashboard
+- Add user management features
+
+---
+
+**Made with ❤️ for treasure hunters everywhere!**

@@ -1,2 +1,0 @@
-# Standalone Bot Requirements - Only essential package needed
-python-telegram-bot>=20.0
