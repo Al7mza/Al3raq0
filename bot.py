@@ -112,6 +112,7 @@ RED_UPPER2_V = int(os.environ.get("RED_UPPER2_V", "255"))
 IMAGES_DIR: str = "images"
 DB_PATH: str = "database.json"
 TEXT_REPLIES_DB_PATH: str = "text_replies.json"
+QUERIES_DIR: str = "queries"
 
 # Similarity thresholds and weights
 SIMILARITY_THRESHOLD: int = int(os.environ.get("SIMILARITY_THRESHOLD", "80"))
@@ -126,6 +127,8 @@ MAX_OCR_CALLS: int = int(os.environ.get("MAX_OCR_CALLS", "24"))
 # Overlap acceptance
 MIN_TOKEN_OVERLAP: int = int(os.environ.get("MIN_TOKEN_OVERLAP", "1"))
 MIN_SIMILARITY_FALLBACK: int = int(os.environ.get("MIN_SIMILARITY_FALLBACK", "70"))
+MIN_LCS_ACCEPT: int = int(os.environ.get("MIN_LCS_ACCEPT", "2"))
+CENTER_RATIO: float = float(os.environ.get("CENTER_RATIO", "0.5"))
 
 # Initialize logging
 logging.basicConfig(
@@ -142,6 +145,8 @@ logger = logging.getLogger(__name__)
 def ensure_storage() -> None:
     if not os.path.isdir(IMAGES_DIR):
         os.makedirs(IMAGES_DIR, exist_ok=True)
+    if not os.path.isdir(QUERIES_DIR):
+        os.makedirs(QUERIES_DIR, exist_ok=True)
     if not os.path.isfile(DB_PATH):
         with open(DB_PATH, "w", encoding="utf-8") as f:
             json.dump([], f, ensure_ascii=False, indent=2)
@@ -227,6 +232,27 @@ def jaccard(a: set, b: set) -> float:
     inter = len(a & b)
     union = len(a | b)
     return inter / union if union else 0.0
+
+def longest_common_substring_length(a: str, b: str) -> int:
+    if not a or not b:
+        return 0
+    # DP over shorter dimension to control memory if needed
+    n, m = len(a), len(b)
+    prev = [0] * (m + 1)
+    best = 0
+    for i in range(1, n + 1):
+        curr = [0]
+        ai = a[i - 1]
+        for j in range(1, m + 1):
+            if ai == b[j - 1]:
+                val = prev[j - 1] + 1
+            else:
+                val = 0
+            curr.append(val)
+            if val > best:
+                best = val
+        prev = curr
+    return best
 
 
 def build_token_set(text: str) -> set:
@@ -475,6 +501,31 @@ def extract_text_from_image(image_path: str) -> str:
     best = max(candidates, key=lambda s: (count_cjk(s), len(s)))
     return best
 
+def extract_center_text(image_path: str) -> str:
+    image = cv2.imread(image_path)
+    if image is None:
+        return ""
+    h, w = image.shape[:2]
+    ch = max(1, int(h * CENTER_RATIO))
+    cw = max(1, int(w * CENTER_RATIO))
+    y0 = (h - ch) // 2
+    x0 = (w - cw) // 2
+    center = image[y0:y0 + ch, x0:x0 + cw]
+    candidates: List[str] = []
+    calls = 0
+    for variant in preprocess_variants_full(center):
+        if calls >= MAX_OCR_CALLS:
+            break
+        text = ocr_with_cloud(variant)
+        calls += 1
+        if text:
+            candidates.append(text)
+            if count_cjk(text) >= 3:
+                break
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda s: (count_cjk(s), len(s)))
+
 
 def extract_yellow_text(image_path: str) -> str:
     """Extract Chinese text focusing on yellow content across the whole image (ROIs + masked)."""
@@ -618,7 +669,10 @@ def extract_text_for_add(image_path: str) -> str:
 
 
 def extract_text_for_query(image_path: str) -> str:
-    """User query: use robust full-image OCR only (color-agnostic)."""
+    """User query: focus center first, then full-image OCR (color-agnostic)."""
+    text = extract_center_text(image_path)
+    if text:
+        return text
     return extract_text_from_image(image_path)
 
 
@@ -705,6 +759,7 @@ def find_best_match(query_text: str) -> Tuple[Optional[Dict[str, Any]], int, int
     best_sim_score: int = -1
     best_tok_overlap: int = -1
     best_overall_score: float = -1.0
+    best_lcs_len: int = 0
 
     for entry in db:
         candidate_text = entry.get("text", "") or ""
@@ -717,15 +772,20 @@ def find_best_match(query_text: str) -> Tuple[Optional[Dict[str, Any]], int, int
         # weighted similarity
         sim_score = compute_similarity(query_text, candidate_text)
 
+        # LCS on normalized strings
+        lcs_len = longest_common_substring_length(query_norm, candidate_norm)
+
         # overall ranking score prioritizing overlap then similarity
-        overall = overlap * 100 + sim_score
+        overall = overlap * 200 + lcs_len * 50 + sim_score
 
         if overall > best_overall_score:
             best_overall_score = overall
             best_entry = entry
             best_sim_score = sim_score
             best_tok_overlap = overlap
+            best_lcs_len = lcs_len
 
+    # Stash best lcs in sim score lower bits? Keep interface: return sim and overlap
     return best_entry, best_sim_score if best_entry else 0, max(0, best_tok_overlap)
 
 
@@ -746,7 +806,10 @@ def find_best_text_reply(query_text: str) -> Tuple[Optional[Dict[str, Any]], int
         entry_tokens = set(entry.get("tokens") or build_token_set(candidate_text))
         overlap = len(query_tokens & entry_tokens)
         sim_score = compute_similarity(query_text, candidate_text)
-        overall = overlap * 100 + sim_score
+        # approximate LCS on normalized strings
+        candidate_norm = normalize_text(candidate_text)
+        lcs_len = longest_common_substring_length(normalize_text(query_text), candidate_norm)
+        overall = overlap * 200 + lcs_len * 50 + sim_score
         if overall > best_overall_score:
             best_overall_score = overall
             best_entry = entry
@@ -969,7 +1032,7 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # User query flow
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     largest = message.photo[-1]
-    tmp_path = await download_photo_as_file(update, context, IMAGES_DIR, largest.file_id, fallback_suffix="_query")
+    tmp_path = await download_photo_as_file(update, context, QUERIES_DIR, largest.file_id, fallback_suffix="_query")
     if not tmp_path:
         await message.reply_text("Failed to download the photo.")
         return
@@ -1001,7 +1064,9 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     logger.info("Query text: %s | Best score: %s | Overlap: %s", query_text, best_score, best_overlap)
 
-    if best_entry and (best_overlap >= MIN_TOKEN_OVERLAP or best_score >= SIMILARITY_THRESHOLD or (best_score >= MIN_SIMILARITY_FALLBACK and best_overlap >= 0)):
+    # Accept if center/full text shares 2+ char substring, or token overlap, or similarity thresholds
+    lcs_len_best = longest_common_substring_length(normalize_text(query_text), normalize_text(best_entry.get("text", "") if best_entry else "")) if best_entry else 0
+    if best_entry and (lcs_len_best >= MIN_LCS_ACCEPT or best_overlap >= MIN_TOKEN_OVERLAP or best_score >= SIMILARITY_THRESHOLD or (best_score >= MIN_SIMILARITY_FALLBACK and best_overlap >= 0)):
         image_path = best_entry.get("image_path")
         if image_path and os.path.isfile(image_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
@@ -1067,7 +1132,7 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     try:
         telegram_file = await context.bot.get_file(doc.file_id)
-        local_path = os.path.join(IMAGES_DIR, f"{int(time.time())}_{doc.file_unique_id}_query")
+        local_path = os.path.join(QUERIES_DIR, f"{int(time.time())}_{doc.file_unique_id}_query")
         ext = ".jpg"
         mime = (doc.mime_type or "").lower()
         if "/png" in mime:
@@ -1104,7 +1169,8 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     best_entry, best_score, best_overlap = find_best_match(query_text)
 
-    if best_entry and (best_overlap >= MIN_TOKEN_OVERLAP or best_score >= SIMILARITY_THRESHOLD or (best_score >= MIN_SIMILARITY_FALLBACK and best_overlap >= 0)):
+    lcs_len_best = longest_common_substring_length(normalize_text(query_text), normalize_text(best_entry.get("text", "") if best_entry else "")) if best_entry else 0
+    if best_entry and (lcs_len_best >= MIN_LCS_ACCEPT or best_overlap >= MIN_TOKEN_OVERLAP or best_score >= SIMILARITY_THRESHOLD or (best_score >= MIN_SIMILARITY_FALLBACK and best_overlap >= 0)):
         image_path = best_entry.get("image_path")
         if image_path and os.path.isfile(image_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
