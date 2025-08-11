@@ -1,0 +1,9 @@
+python-telegram-bot==20.7
+Pillow==10.1.0
+pytesseract==0.3.10
+fuzzywuzzy==0.18.0
+python-Levenshtein==0.23.0
+sqlite3
+opencv-python==4.8.1.78
+numpy==1.24.3
+python-dotenv==1.0.0
