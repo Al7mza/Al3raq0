@@ -87,6 +87,7 @@ WEIGHT_TOKEN_SET: float = float(os.environ.get("WEIGHT_TOKEN_SET", "0.25"))
 WEIGHT_PARTIAL_TOKEN_SET: float = float(os.environ.get("WEIGHT_PARTIAL_TOKEN_SET", "0.1"))
 WEIGHT_NGRAM_JACCARD: float = float(os.environ.get("WEIGHT_NGRAM_JACCARD", "0.05"))
 NGRAM_N: int = int(os.environ.get("NGRAM_N", "2"))
+MAX_OCR_CALLS: int = int(os.environ.get("MAX_OCR_CALLS", "14"))
 
 # Initialize logging
 logging.basicConfig(
@@ -232,6 +233,14 @@ def preprocess_variants_full(image_bgr: np.ndarray) -> List[np.ndarray]:
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
         variants.append(th)
+        # inverted
+        variants.append(cv2.bitwise_not(th))
+        # 90-degree rotations on thresholded image
+        variants.append(cv2.rotate(th, cv2.ROTATE_90_CLOCKWISE))
+        variants.append(cv2.rotate(th, cv2.ROTATE_90_COUNTERCLOCKWISE))
+        # upscale thresholded image for small text
+        th_up = cv2.resize(th, None, fx=1.7, fy=1.7, interpolation=cv2.INTER_CUBIC)
+        variants.append(th_up)
 
     if "clahe_v" in OCR_VARIANTS:
         hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
@@ -261,52 +270,58 @@ def preprocess_variants_full(image_bgr: np.ndarray) -> List[np.ndarray]:
 
 
 def ocr_with_cloud(image_np: np.ndarray) -> str:
-    """Call OCR.space API to extract Chinese Simplified text from the provided image array."""
+    """Call OCR.space API to extract Chinese text; try engine 2 then 1; language chs+eng."""
     success, encoded = cv2.imencode(
         ".jpg", image_np, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
     )
     if not success:
         return ""
-    data = {
-        "language": "chs",
-        "isOverlayRequired": "false",
-        "OCREngine": "2",
-        "scale": "true",
-        "detectOrientation": "true",
-    }
-    headers = {"apikey": OCR_API_KEY}
-    files = {
-        "file": ("image.jpg", encoded.tobytes(), "image/jpeg"),
-    }
-    try:
-        resp = requests.post(
-            OCR_API_ENDPOINT,
-            headers=headers,
-            data=data,
-            files=files,
-            timeout=OCR_TIMEOUT_SECONDS,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as e:
-        logger.error("Cloud OCR request failed: %s", e)
-        return ""
 
-    try:
-        if payload.get("IsErroredOnProcessing"):
-            logger.warning("OCR error: %s", payload.get("ErrorMessage"))
+    headers = {"apikey": OCR_API_KEY}
+    files = {"file": ("image.jpg", encoded.tobytes(), "image/jpeg")}
+
+    def call_engine(engine: int) -> str:
+        data = {
+            "language": "chs+eng",
+            "isOverlayRequired": "false",
+            "OCREngine": str(engine),
+            "scale": "true",
+            "detectOrientation": "true",
+        }
+        try:
+            resp = requests.post(
+                OCR_API_ENDPOINT,
+                headers=headers,
+                data=data,
+                files=files,
+                timeout=OCR_TIMEOUT_SECONDS,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            logger.error("Cloud OCR request failed (engine %s): %s", engine, e)
             return ""
-        results = payload.get("ParsedResults", [])
-        texts: List[str] = []
-        for r in results:
-            t = r.get("ParsedText", "")
-            if t:
-                texts.append(t)
-        combined = " ".join(s.strip() for s in texts if s.strip())
-        return combined
-    except Exception as e:
-        logger.error("Cloud OCR parse failed: %s", e)
-        return ""
+
+        try:
+            if payload.get("IsErroredOnProcessing"):
+                logger.warning("OCR error (engine %s): %s", engine, payload.get("ErrorMessage"))
+                return ""
+            results = payload.get("ParsedResults", [])
+            texts: List[str] = []
+            for r in results:
+                t = r.get("ParsedText", "")
+                if t:
+                    texts.append(t)
+            return " ".join(s.strip() for s in texts if s.strip())
+        except Exception as e:
+            logger.error("Cloud OCR parse failed (engine %s): %s", engine, e)
+            return ""
+
+    text2 = call_engine(2)
+    if count_cjk(text2) >= 2:
+        return text2
+    text1 = call_engine(1) if not text2 else text2
+    return text1
 
 
 def extract_text_from_image(image_path: str) -> str:
@@ -316,18 +331,21 @@ def extract_text_from_image(image_path: str) -> str:
         return ""
 
     candidates: List[str] = []
+    calls = 0
     for variant in preprocess_variants_full(image):
+        if calls >= MAX_OCR_CALLS:
+            break
         text = ocr_with_cloud(variant)
+        calls += 1
         if text:
             candidates.append(text)
+            if count_cjk(text) >= 3:
+                break
 
     if not candidates:
         return ""
 
-    def cjk_count(s: str) -> int:
-        return sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
-
-    best = max(candidates, key=lambda s: (cjk_count(s), len(s)))
+    best = max(candidates, key=lambda s: (count_cjk(s), len(s)))
     return best
 
 
@@ -338,23 +356,49 @@ def extract_yellow_text(image_path: str) -> str:
         return ""
     mask = yellow_mask_bgr(image)
     candidates: List[str] = []
+    calls = 0
     # ROI-based
     for roi in find_rois_from_mask(image, mask):
-        t = ocr_with_cloud(to_thresh(roi)) or ocr_with_cloud(roi)
+        if calls >= MAX_OCR_CALLS:
+            break
+        t = ocr_with_cloud(to_thresh(roi))
+        calls += 1
+        if not t and calls < MAX_OCR_CALLS:
+            t = ocr_with_cloud(roi)
+            calls += 1
         if t:
             candidates.append(t)
-            # Do not break; gather multiple to maximize recall
+            if count_cjk(t) >= 3:
+                break
     # Full masked
     masked = cv2.bitwise_and(image, image, mask=mask)
-    t_mask = ocr_with_cloud(to_thresh(masked)) or ocr_with_cloud(masked)
+    t_mask = None
+    if calls < MAX_OCR_CALLS:
+        t_mask = ocr_with_cloud(to_thresh(masked))
+        calls += 1
+    if not t_mask and calls < MAX_OCR_CALLS:
+        t_mask = ocr_with_cloud(masked)
+        calls += 1
     if t_mask:
         candidates.append(t_mask)
+        if count_cjk(t_mask) < 3 and calls < MAX_OCR_CALLS:
+            # Try rotated masked threshold
+            masked_th = to_thresh(masked)
+            rot1 = cv2.rotate(masked_th, cv2.ROTATE_90_CLOCKWISE)
+            rot2 = cv2.rotate(masked_th, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            for rot in (rot1, rot2):
+                if calls >= MAX_OCR_CALLS:
+                    break
+                tr = ocr_with_cloud(rot)
+                calls += 1
+                if tr:
+                    candidates.append(tr)
+                    if count_cjk(tr) >= 3:
+                        break
 
     if not candidates:
         return ""
-    def cjk_count(s: str) -> int:
-        return sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
-    return max(candidates, key=lambda s: (cjk_count(s), len(s)))
+    return max(candidates, key=lambda s: (count_cjk(s), len(s)))
 
 
 def extract_bottom_yellow_text(image_path: str) -> str:
