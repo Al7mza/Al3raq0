@@ -66,6 +66,15 @@ OCR_VARIANTS: List[str] = [
     "adaptive",
 ]
 
+# Yellow detection HSV bounds (tunable via env)
+YELLOW_LOWER_H = int(os.environ.get("YELLOW_LOWER_H", "15"))
+YELLOW_LOWER_S = int(os.environ.get("YELLOW_LOWER_S", "80"))
+YELLOW_LOWER_V = int(os.environ.get("YELLOW_LOWER_V", "80"))
+YELLOW_UPPER_H = int(os.environ.get("YELLOW_UPPER_H", "40"))
+YELLOW_UPPER_S = int(os.environ.get("YELLOW_UPPER_S", "255"))
+YELLOW_UPPER_V = int(os.environ.get("YELLOW_UPPER_V", "255"))
+BOTTOM_RATIO = float(os.environ.get("BOTTOM_RATIO", "0.3"))  # bottom 30% band
+
 # Storage paths
 IMAGES_DIR: str = "images"
 DB_PATH: str = "database.json"
@@ -164,6 +173,52 @@ def jaccard(a: set, b: set) -> float:
     inter = len(a & b)
     union = len(a | b)
     return inter / union if union else 0.0
+
+
+def build_token_set(text: str) -> set:
+    """Build a token set combining jieba tokens and character n-grams of normalized text."""
+    simple = to_simplified(text)
+    norm = normalize_text(simple)
+    words = set(tokenize_chinese(simple))
+    grams = ngram_set(norm, NGRAM_N)
+    return {t for t in (words | grams) if t}
+
+
+def yellow_mask_bgr(image_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([YELLOW_LOWER_H, YELLOW_LOWER_S, YELLOW_LOWER_V])
+    upper = np.array([YELLOW_UPPER_H, YELLOW_UPPER_S, YELLOW_UPPER_V])
+    mask = cv2.inRange(hsv, lower, upper)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    return mask
+
+
+def find_rois_from_mask(image_bgr: np.ndarray, mask: np.ndarray, min_area: int = 200, max_count: int = 10) -> List[np.ndarray]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rois: List[np.ndarray] = []
+    h, w = mask.shape[:2]
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        if cw * ch < min_area:
+            continue
+        pad = max(2, int(0.05 * max(cw, ch)))
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(w, x + cw + pad)
+        y1 = min(h, y + ch + pad)
+        roi = image_bgr[y0:y1, x0:x1]
+        if roi.size > 0:
+            rois.append(roi)
+    rois.sort(key=lambda r: r.shape[0] * r.shape[1], reverse=True)
+    return rois[:max_count]
+
+
+def to_thresh(image_bgr_or_gray: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr_or_gray, cv2.COLOR_BGR2GRAY) if len(image_bgr_or_gray.shape) == 3 else image_bgr_or_gray
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    return th
 
 
 def preprocess_variants_full(image_bgr: np.ndarray) -> List[np.ndarray]:
@@ -276,6 +331,82 @@ def extract_text_from_image(image_path: str) -> str:
     return best
 
 
+def extract_yellow_text(image_path: str) -> str:
+    """Extract Chinese text focusing on yellow content across the whole image (ROIs + masked)."""
+    image = cv2.imread(image_path)
+    if image is None:
+        return ""
+    mask = yellow_mask_bgr(image)
+    candidates: List[str] = []
+    # ROI-based
+    for roi in find_rois_from_mask(image, mask):
+        t = ocr_with_cloud(to_thresh(roi)) or ocr_with_cloud(roi)
+        if t:
+            candidates.append(t)
+            # Do not break; gather multiple to maximize recall
+    # Full masked
+    masked = cv2.bitwise_and(image, image, mask=mask)
+    t_mask = ocr_with_cloud(to_thresh(masked)) or ocr_with_cloud(masked)
+    if t_mask:
+        candidates.append(t_mask)
+
+    if not candidates:
+        return ""
+    def cjk_count(s: str) -> int:
+        return sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
+    return max(candidates, key=lambda s: (cjk_count(s), len(s)))
+
+
+def extract_bottom_yellow_text(image_path: str) -> str:
+    """Extract Chinese text from bottom band focusing on yellow (admin references often at bottom)."""
+    image = cv2.imread(image_path)
+    if image is None:
+        return ""
+    h, w = image.shape[:2]
+    band_top = int(h * (1.0 - max(0.05, min(0.9, BOTTOM_RATIO))))
+    band = image[band_top:h, 0:w]
+    # Reuse yellow pipeline on the band
+    tmp_file = None
+    try:
+        # Avoid writing; process directly
+        mask = yellow_mask_bgr(band)
+        candidates: List[str] = []
+        for roi in find_rois_from_mask(band, mask):
+            t = ocr_with_cloud(to_thresh(roi)) or ocr_with_cloud(roi)
+            if t:
+                candidates.append(t)
+        masked = cv2.bitwise_and(band, band, mask=mask)
+        t_band = ocr_with_cloud(to_thresh(masked)) or ocr_with_cloud(masked)
+        if t_band:
+            candidates.append(t_band)
+        if not candidates:
+            return ""
+        def cjk_count(s: str) -> int:
+            return sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
+        return max(candidates, key=lambda s: (cjk_count(s), len(s)))
+    finally:
+        pass
+
+
+def extract_text_for_add(image_path: str) -> str:
+    """Admin add: prefer bottom yellow text; fallback to full yellow; then full-image variants."""
+    text = extract_bottom_yellow_text(image_path)
+    if text:
+        return text
+    text = extract_yellow_text(image_path)
+    if text:
+        return text
+    return extract_text_from_image(image_path)
+
+
+def extract_text_for_query(image_path: str) -> str:
+    """User query: prefer yellow text across the whole image; fallback to full-image variants."""
+    text = extract_yellow_text(image_path)
+    if text:
+        return text
+    return extract_text_from_image(image_path)
+
+
 def compute_similarity(query_text: str, candidate_text: str) -> int:
     """Compute a weighted similarity score (0-100) combining multiple fuzzy metrics and n-gram Jaccard."""
     q_simpl = to_simplified(query_text)
@@ -325,23 +456,40 @@ def add_entry_to_db(image_path: str, text: str) -> None:
     save_database(db)
 
 
-def find_best_match(query_text: str) -> Tuple[Optional[Dict[str, Any]], int]:
-    """Return (best_entry, best_score) using multi-metric weighted similarity."""
+def find_best_match(query_text: str) -> Tuple[Optional[Dict[str, Any]], int, int]:
+    """Return (best_entry, best_similarity_score, best_token_overlap).
+    Accept if token overlap >= 1 or similarity >= SIMILARITY_THRESHOLD.
+    """
     db = load_database()
     if not db:
-        return None, 0
+        return None, 0, 0
 
-    best_entry: Optional[Dict[str, Any]] = None
-    best_score: int = -1
+    query_tokens = build_token_set(query_text)
+
+    best_sim_entry: Optional[Dict[str, Any]] = None
+    best_sim_score: int = -1
+
+    best_tok_entry: Optional[Dict[str, Any]] = None
+    best_tok_overlap: int = -1
 
     for entry in db:
         candidate_text = entry.get("text", "") or ""
-        score = compute_similarity(query_text, candidate_text)
-        if score > best_score:
-            best_score = score
-            best_entry = entry
+        # similarity
+        sim_score = compute_similarity(query_text, candidate_text)
+        if sim_score > best_sim_score:
+            best_sim_score = sim_score
+            best_sim_entry = entry
+        # token overlap
+        entry_tokens = build_token_set(candidate_text)
+        overlap = len(query_tokens & entry_tokens)
+        if overlap > best_tok_overlap:
+            best_tok_overlap = overlap
+            best_tok_entry = entry
 
-    return best_entry, best_score if best_entry else 0
+    # Prefer token overlap if exists, else similarity
+    if best_tok_entry and best_tok_overlap >= 1:
+        return best_tok_entry, best_sim_score, best_tok_overlap
+    return best_sim_entry, best_sim_score, max(0, best_tok_overlap)
 
 
 async def download_photo_as_file(
@@ -400,7 +548,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not local_path:
             await message.reply_text("Failed to download the photo.")
             return
-        text = extract_text_from_image(local_path)
+        text = extract_text_for_add(local_path)
         add_entry_to_db(local_path, text)
         await message.reply_text(
             f"Added image to database. Extracted text: {text or '(none)'}"
@@ -439,7 +587,7 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not local_path:
             await message.reply_text("Failed to download the photo.")
             return
-        text = extract_text_from_image(local_path)
+        text = extract_text_for_add(local_path)
         add_entry_to_db(local_path, text)
         await message.reply_text(
             f"Added image to database. Extracted text: {text or '(none)'}"
@@ -454,18 +602,19 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("Failed to download the photo.")
         return
 
-    query_text = extract_text_from_image(tmp_path)
-    best_entry, best_score = find_best_match(query_text)
+    query_text = extract_text_for_query(tmp_path)
+    best_entry, best_score, best_overlap = find_best_match(query_text)
 
-    logger.info("Cloud OCR | Query text: %s | Best score: %s", query_text, best_score)
+    logger.info("Query text: %s | Best score: %s | Overlap: %s", query_text, best_score, best_overlap)
 
-    if best_entry and best_score >= SIMILARITY_THRESHOLD:
+    if best_entry and (best_overlap >= 1 or best_score >= SIMILARITY_THRESHOLD):
         image_path = best_entry.get("image_path")
         if image_path and os.path.isfile(image_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
                 with open(image_path, "rb") as f:
-                    await message.reply_photo(photo=f, caption=f"Match {best_score}%")
+                    cap = f"Match {'word overlap' if best_overlap>=1 else str(best_score)+'%'}"
+                    await message.reply_photo(photo=f, caption=cap)
             except Exception as e:
                 logger.exception("Failed to send matched image: %s", e)
                 await message.reply_text("Sorry, failed to send the matched image.")
@@ -497,7 +646,6 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             telegram_file = await context.bot.get_file(doc.file_id)
             local_path = os.path.join(IMAGES_DIR, f"{int(time.time())}_{doc.file_unique_id}_add")
-            # Try to infer extension from mime
             ext = ".jpg"
             if "/png" in mime:
                 ext = ".png"
@@ -510,7 +658,7 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await message.reply_text("Failed to download the image document.")
             return
 
-        text = extract_text_from_image(local_path)
+        text = extract_text_for_add(local_path)
         add_entry_to_db(local_path, text)
         await message.reply_text(
             f"Added image to database. Extracted text: {text or '(none)'}"
@@ -535,16 +683,17 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("Failed to download the image document.")
         return
 
-    query_text = extract_text_from_image(local_path)
-    best_entry, best_score = find_best_match(query_text)
+    query_text = extract_text_for_query(local_path)
+    best_entry, best_score, best_overlap = find_best_match(query_text)
 
-    if best_entry and best_score >= SIMILARITY_THRESHOLD:
+    if best_entry and (best_overlap >= 1 or best_score >= SIMILARITY_THRESHOLD):
         image_path = best_entry.get("image_path")
         if image_path and os.path.isfile(image_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
                 with open(image_path, "rb") as f:
-                    await message.reply_photo(photo=f, caption=f"Match {best_score}%")
+                    cap = f"Match {'word overlap' if best_overlap>=1 else str(best_score)+'%'}"
+                    await message.reply_photo(photo=f, caption=cap)
             except Exception as e:
                 logger.exception("Failed to send matched image: %s", e)
                 await message.reply_text("Sorry, failed to send the matched image.")
