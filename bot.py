@@ -54,6 +54,13 @@ OCR_API_KEY: str = os.environ.get("OCR_API_KEY", "K88956884888957")
 OCR_API_ENDPOINT: str = "https://api.ocr.space/parse/image"
 OCR_TIMEOUT_SECONDS: int = 30
 
+# OCR behavior toggles
+OCR_TRY_ROIS: bool = os.environ.get("OCR_USE_ROIS", "1") == "1"
+OCR_TRY_MASKED: bool = os.environ.get("OCR_TRY_MASKED", "1") == "1"
+OCR_TRY_ORIGINAL: bool = os.environ.get("OCR_TRY_ORIGINAL", "1") == "1"
+OCR_MAX_ROIS: int = int(os.environ.get("OCR_MAX_ROIS", "10"))
+OCR_MIN_ROI_AREA: int = int(os.environ.get("OCR_MIN_ROI_AREA", "200"))
+
 # Storage paths
 IMAGES_DIR: str = "images"
 DB_PATH: str = "database.json"
@@ -94,12 +101,21 @@ def save_database(db: List[Dict[str, Any]]) -> None:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
 
+def get_yellow_hsv_bounds() -> Tuple[np.ndarray, np.ndarray]:
+    """Read HSV bounds from env if provided; otherwise use sensible defaults."""
+    lower_h = int(os.environ.get("YELLOW_LOWER_H", "15"))
+    lower_s = int(os.environ.get("YELLOW_LOWER_S", "80"))
+    lower_v = int(os.environ.get("YELLOW_LOWER_V", "80"))
+    upper_h = int(os.environ.get("YELLOW_UPPER_H", "40"))
+    upper_s = int(os.environ.get("YELLOW_UPPER_S", "255"))
+    upper_v = int(os.environ.get("YELLOW_UPPER_V", "255"))
+    return np.array([lower_h, lower_s, lower_v]), np.array([upper_h, upper_s, upper_v])
+
+
 def yellow_mask_bgr(image_bgr: np.ndarray) -> np.ndarray:
     """Return a cleaned mask isolating yellow regions in a BGR image."""
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    # Yellow range in HSV (tune if needed)
-    lower_yellow = np.array([15, 80, 80])
-    upper_yellow = np.array([35, 255, 255])
+    lower_yellow, upper_yellow = get_yellow_hsv_bounds()
     mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
     # Morphological operations to remove noise and strengthen text strokes
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -108,19 +124,51 @@ def yellow_mask_bgr(image_bgr: np.ndarray) -> np.ndarray:
     return mask
 
 
+def find_rois_from_mask(image_bgr: np.ndarray, mask: np.ndarray) -> List[np.ndarray]:
+    """Find ROI crops from the original image using the mask's contours."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rois: List[np.ndarray] = []
+    height, width = mask.shape[:2]
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w * h < OCR_MIN_ROI_AREA:
+            continue
+        # Expand box slightly
+        pad = max(2, int(0.05 * max(w, h)))
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(width, x + w + pad)
+        y1 = min(height, y + h + pad)
+        roi = image_bgr[y0:y1, x0:x1]
+        if roi.size > 0:
+            rois.append(roi)
+    # Sort ROIs by area descending and cap
+    rois.sort(key=lambda r: r.shape[0] * r.shape[1], reverse=True)
+    return rois[:OCR_MAX_ROIS]
+
+
+def to_thresh(image_bgr_or_gray: np.ndarray) -> np.ndarray:
+    if len(image_bgr_or_gray.shape) == 3:
+        gray = cv2.cvtColor(image_bgr_or_gray, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image_bgr_or_gray
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    return thresh
+
+
 def ocr_with_cloud(image_np: np.ndarray) -> str:
     """Call OCR.space API to extract Chinese Simplified text from the provided image array."""
-    # Encode to JPEG to reduce size
     success, encoded = cv2.imencode(
         ".jpg", image_np, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
     )
     if not success:
         return ""
     data = {
-        "language": "chs",  # Chinese Simplified
+        "language": "chs",
         "isOverlayRequired": "false",
         "OCREngine": "2",
         "scale": "true",
+        "detectOrientation": "true",
     }
     headers = {"apikey": OCR_API_KEY}
     files = {
@@ -158,18 +206,52 @@ def ocr_with_cloud(image_np: np.ndarray) -> str:
 
 
 def extract_text_from_image(image_path: str) -> str:
-    """Extract Chinese text by isolating yellow regions and running Cloud OCR."""
+    """Extract Chinese text by trying ROI crops, masked full image, then original image."""
     image = cv2.imread(image_path)
     if image is None:
         return ""
 
+    all_candidates: List[str] = []
+
+    # 1) Yellow mask and ROI OCRs
     mask = yellow_mask_bgr(image)
-    masked = cv2.bitwise_and(image, image, mask=mask)
+    if OCR_TRY_ROIS:
+        rois = find_rois_from_mask(image, mask)
+        for roi in rois:
+            # Try thresholded and raw ROI; pick the longer result
+            roi_thresh = to_thresh(roi)
+            text_a = ocr_with_cloud(roi_thresh)
+            if text_a:
+                all_candidates.append(text_a)
+                continue
+            text_b = ocr_with_cloud(roi)
+            if text_b:
+                all_candidates.append(text_b)
 
-    gray = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    # 2) Full masked image
+    if OCR_TRY_MASKED:
+        masked = cv2.bitwise_and(image, image, mask=mask)
+        masked_thresh = to_thresh(masked)
+        text_masked = ocr_with_cloud(masked_thresh)
+        if text_masked:
+            all_candidates.append(text_masked)
 
-    return ocr_with_cloud(thresh)
+    # 3) Original image as fallback
+    if OCR_TRY_ORIGINAL:
+        original_thresh = to_thresh(image)
+        text_orig = ocr_with_cloud(original_thresh)
+        if text_orig:
+            all_candidates.append(text_orig)
+
+    # Pick the candidate with most CJK characters, else longest
+    def cjk_count(s: str) -> int:
+        return sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
+
+    if not all_candidates:
+        return ""
+
+    best = max(all_candidates, key=lambda s: (cjk_count(s), len(s)))
+    return best
 
 
 def add_entry_to_db(image_path: str, text: str) -> None:
