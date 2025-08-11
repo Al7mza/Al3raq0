@@ -37,6 +37,7 @@ from hanziconv import HanziConv
 from fuzzywuzzy import fuzz
 from telegram import Update
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import InputMediaPhoto
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
@@ -47,6 +48,7 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
+import base64
 
 # =====================
 # Configuration
@@ -134,6 +136,11 @@ CENTER_RATIO: float = float(os.environ.get("CENTER_RATIO", "0.5"))
 # Translation settings
 ENABLE_TRANSLATION: bool = os.environ.get("ENABLE_TRANSLATION", "1") == "1"
 TRANSLATE_TARGET_LANG: str = os.environ.get("TRANSLATE_TARGET_LANG", "en")
+
+# Baidu OCR settings
+BAIDU_API_KEY: str = os.environ.get("BAIDU_OCR_API_KEY", "")
+BAIDU_SECRET_KEY: str = os.environ.get("BAIDU_OCR_SECRET_KEY", "")
+_baidu_token: Dict[str, Any] = {"token": None, "expires_at": 0.0}
 
 # Initialize logging
 logging.basicConfig(
@@ -430,13 +437,21 @@ def scan_tiles(image_bgr: np.ndarray, rows: int = 2, cols: int = 2) -> List[np.n
 
 
 def ocr_with_cloud(image_np: np.ndarray) -> str:
-    """Call OCR.space API to extract Chinese text; try engine 2 then 1; language chs+eng."""
+    """Try Baidu OCR first (high-accuracy Chinese), then OCR.space (engine 2->1)."""
     success, encoded = cv2.imencode(
         ".jpg", image_np, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
     )
     if not success:
         return ""
 
+    # 1) Baidu OCR
+    baidu_text = ""
+    if BAIDU_API_KEY and BAIDU_SECRET_KEY:
+        baidu_text = ocr_with_baidu_bytes(encoded.tobytes())
+        if count_cjk(baidu_text) >= 2:
+            return baidu_text
+
+    # 2) OCR.space
     headers = {"apikey": OCR_API_KEY}
     files = {"file": ("image.jpg", encoded.tobytes(), "image/jpeg")}
 
@@ -482,6 +497,66 @@ def ocr_with_cloud(image_np: np.ndarray) -> str:
         return text2
     text1 = call_engine(1) if not text2 else text2
     return text1
+
+def baidu_get_token() -> Optional[str]:
+    now = time.time()
+    if _baidu_token["token"] and now < _baidu_token["expires_at"]:
+        return _baidu_token["token"]
+    try:
+        resp = requests.get(
+            "https://aip.baidubce.com/oauth/2.0/token",
+            params={
+                "grant_type": "client_credentials",
+                "client_id": BAIDU_API_KEY,
+                "client_secret": BAIDU_SECRET_KEY,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("access_token")
+        expires_in = float(data.get("expires_in", 3600))
+        if token:
+            _baidu_token["token"] = token
+            _baidu_token["expires_at"] = now + max(600.0, expires_in - 120.0)
+            return token
+    except Exception as e:
+        logger.warning("Baidu token fetch failed: %s", e)
+    return None
+
+def ocr_with_baidu_bytes(jpeg_bytes: bytes) -> str:
+    token = baidu_get_token()
+    if not token:
+        return ""
+    img_b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+    # Try accurate_basic first, then general_basic
+    for endpoint in [
+        "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic",
+        "https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic",
+    ]:
+        try:
+            resp = requests.post(
+                f"{endpoint}?access_token={token}",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "image": img_b64,
+                    "language_type": "CHN_ENG",
+                    "detect_direction": "true",
+                    "probability": "true",
+                },
+                timeout=OCR_TIMEOUT_SECONDS,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if "words_result" in data:
+                words = [w.get("words", "") for w in data.get("words_result", [])]
+                text = " ".join(w.strip() for w in words if w.strip())
+                if text:
+                    return text
+        except Exception as e:
+            logger.warning("Baidu OCR error: %s", e)
+            continue
+    return ""
 
 
 def extract_text_from_image(image_path: str) -> str:
@@ -1108,14 +1183,15 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if reply_path and os.path.isfile(reply_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
-                with open(reply_path, "rb") as f:
-                    cap = f"Reply {'word overlap' if reply_overlap>=MIN_TOKEN_OVERLAP else str(reply_score)+'%'}"
-                    await message.reply_photo(photo=f, caption=cap)
+                media = []
+                media.append(InputMediaPhoto(open(reply_path, "rb"), caption=f"Reply {'overlap' if reply_overlap>=MIN_TOKEN_OVERLAP else str(reply_score)+'%'}"))
+                media.append(InputMediaPhoto(open(tmp_path, "rb")))
+                await update.message.reply_media_group(media=media)
             except Exception as e:
                 logger.exception("Failed to send reply image: %s", e)
         else:
             logger.warning("Reply image missing at path: %s", reply_path)
-            await message.reply_text("Sorry, reply image missing.")
+            await update.message.reply_text("Sorry, reply image missing.")
         return
     # Else fallback to image DB
     best_entry, best_score, best_overlap = find_best_match(query_text)
@@ -1129,16 +1205,17 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if image_path and os.path.isfile(image_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
-                with open(image_path, "rb") as f:
-                    cap = f"Match {'word overlap' if best_overlap>=MIN_TOKEN_OVERLAP else str(best_score)+'%'}"
-                    await message.reply_photo(photo=f, caption=cap)
+                media = []
+                media.append(InputMediaPhoto(open(image_path, "rb"), caption=f"Match {'overlap' if best_overlap>=MIN_TOKEN_OVERLAP else str(best_score)+'%'}"))
+                media.append(InputMediaPhoto(open(tmp_path, "rb")))
+                await update.message.reply_media_group(media=media)
             except Exception as e:
                 logger.exception("Failed to send matched image: %s", e)
-                await message.reply_text("Sorry, failed to send the matched image.")
+                await update.message.reply_text("Sorry, failed to send the matched image.")
         else:
-            await message.reply_text("Matched entry found but image file is missing.")
+            await update.message.reply_text("Matched entry found but image file is missing.")
     else:
-        await message.reply_text("Sorry, no match found.")
+        await update.message.reply_text("Sorry, no match found.")
 
 
 async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1218,9 +1295,10 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if reply_path and os.path.isfile(reply_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
-                with open(reply_path, "rb") as f:
-                    cap = f"Reply {'word overlap' if reply_overlap>=MIN_TOKEN_OVERLAP else str(reply_score)+'%'}"
-                    await message.reply_photo(photo=f, caption=cap)
+                media = []
+                media.append(InputMediaPhoto(open(reply_path, "rb"), caption=f"Reply {'overlap' if reply_overlap>=MIN_TOKEN_OVERLAP else str(reply_score)+'%'}"))
+                media.append(InputMediaPhoto(open(local_path, "rb")))
+                await update.message.reply_media_group(media=media)
             except Exception as e:
                 logger.exception("Failed to send reply image: %s", e)
         else:
@@ -1235,9 +1313,10 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if image_path and os.path.isfile(image_path):
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
-                with open(image_path, "rb") as f:
-                    cap = f"Match {'word overlap' if best_overlap>=MIN_TOKEN_OVERLAP else str(best_score)+'%'}"
-                    await message.reply_photo(photo=f, caption=cap)
+                media = []
+                media.append(InputMediaPhoto(open(image_path, "rb"), caption=f"Match {'overlap' if best_overlap>=MIN_TOKEN_OVERLAP else str(best_score)+'%'}"))
+                media.append(InputMediaPhoto(open(local_path, "rb")))
+                await update.message.reply_media_group(media=media)
             except Exception as e:
                 logger.exception("Failed to send matched image: %s", e)
                 await message.reply_text("Sorry, failed to send the matched image.")
