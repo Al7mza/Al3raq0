@@ -107,7 +107,7 @@ WEIGHT_TOKEN_SET: float = float(os.environ.get("WEIGHT_TOKEN_SET", "0.25"))
 WEIGHT_PARTIAL_TOKEN_SET: float = float(os.environ.get("WEIGHT_PARTIAL_TOKEN_SET", "0.1"))
 WEIGHT_NGRAM_JACCARD: float = float(os.environ.get("WEIGHT_NGRAM_JACCARD", "0.05"))
 NGRAM_N: int = int(os.environ.get("NGRAM_N", "2"))
-MAX_OCR_CALLS: int = int(os.environ.get("MAX_OCR_CALLS", "14"))
+MAX_OCR_CALLS: int = int(os.environ.get("MAX_OCR_CALLS", "24"))
 
 # Initialize logging
 logging.basicConfig(
@@ -332,6 +332,26 @@ def preprocess_variants_full(image_bgr: np.ndarray) -> List[np.ndarray]:
 
     return variants
 
+def scan_tiles(image_bgr: np.ndarray, rows: int = 2, cols: int = 2) -> List[np.ndarray]:
+    """Split image into tiles and produce simple thresholded variants to improve recall."""
+    h, w = image_bgr.shape[:2]
+    tile_h = max(1, h // rows)
+    tile_w = max(1, w // cols)
+    variants: List[np.ndarray] = []
+    for r in range(rows):
+        for c in range(cols):
+            y0 = r * tile_h
+            x0 = c * tile_w
+            y1 = h if r == rows - 1 else (r + 1) * tile_h
+            x1 = w if c == cols - 1 else (c + 1) * tile_w
+            tile = image_bgr[y0:y1, x0:x1]
+            if tile.size == 0:
+                continue
+            gray = cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY)
+            _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            variants.append(th)
+    return variants
+
 
 def ocr_with_cloud(image_np: np.ndarray) -> str:
     """Call OCR.space API to extract Chinese text; try engine 2 then 1; language chs+eng."""
@@ -405,6 +425,16 @@ def extract_text_from_image(image_path: str) -> str:
             candidates.append(text)
             if count_cjk(text) >= 3:
                 break
+
+    # If still weak, scan tiles to capture smaller/localized text
+    if calls < MAX_OCR_CALLS and (not candidates or count_cjk(max(candidates, key=lambda s: count_cjk(s))) < 2):
+        for tvar in scan_tiles(image, rows=2, cols=2):
+            if calls >= MAX_OCR_CALLS:
+                break
+            ttext = ocr_with_cloud(tvar)
+            calls += 1
+            if ttext:
+                candidates.append(ttext)
 
     if not candidates:
         return ""
@@ -840,9 +870,10 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not message or not message.photo:
         return
 
-    caption = (message.caption or "").strip().lower()
+    caption = (message.caption or "").strip()
+    caption_lower = caption.lower()
 
-    if caption.startswith("/add"):
+    if caption_lower == "$+" or caption_lower.startswith("/add"):
         if not is_admin(user.id):
             await message.reply_text("Only the administrator can use /add.")
             return
@@ -855,7 +886,11 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not local_path:
             await message.reply_text("Failed to download the photo.")
             return
-        text = extract_text_for_add(local_path)
+        try:
+            text = extract_text_for_add(local_path)
+        except Exception as e:
+            logger.exception("Add OCR failed: %s", e)
+            text = ""
         add_entry_to_db(local_path, text)
         await message.reply_text(
             f"Added image to database. Extracted text: {text or '(none)'}"
@@ -870,7 +905,12 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("Failed to download the photo.")
         return
 
-    query_text = extract_text_for_query(tmp_path)
+    try:
+        query_text = extract_text_for_query(tmp_path)
+    except Exception as e:
+        logger.exception("Query OCR failed: %s", e)
+        await message.reply_text("Sorry, OCR failed. Please try another image or later.")
+        return
     # First try text-reply mappings
     best_reply_entry, reply_score, reply_overlap = find_best_text_reply(query_text)
     if best_reply_entry and (reply_overlap >= 1 or reply_score >= SIMILARITY_THRESHOLD):
@@ -921,9 +961,10 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     user = update.effective_user
-    caption = (message.caption or "").strip().lower()
+    caption = (message.caption or "").strip()
+    caption_lower = caption.lower()
 
-    if caption.startswith("/add"):
+    if caption_lower == "$+" or caption_lower.startswith("/add"):
         if not is_admin(user.id):
             await message.reply_text("Only the administrator can use /add.")
             return
@@ -931,6 +972,7 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             telegram_file = await context.bot.get_file(doc.file_id)
             local_path = os.path.join(IMAGES_DIR, f"{int(time.time())}_{doc.file_unique_id}_add")
+            # Try to infer extension from mime
             ext = ".jpg"
             if "/png" in mime:
                 ext = ".png"
@@ -943,7 +985,11 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await message.reply_text("Failed to download the image document.")
             return
 
-        text = extract_text_for_add(local_path)
+        try:
+            text = extract_text_for_add(local_path)
+        except Exception as e:
+            logger.exception("Add OCR failed: %s", e)
+            text = ""
         add_entry_to_db(local_path, text)
         await message.reply_text(
             f"Added image to database. Extracted text: {text or '(none)'}"
@@ -968,7 +1014,12 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("Failed to download the image document.")
         return
 
-    query_text = extract_text_for_query(local_path)
+    try:
+        query_text = extract_text_for_query(local_path)
+    except Exception as e:
+        logger.exception("Query OCR failed: %s", e)
+        await message.reply_text("Sorry, OCR failed. Please try another image or later.")
+        return
     best_reply_entry, reply_score, reply_overlap = find_best_text_reply(query_text)
     if best_reply_entry and (reply_overlap >= 1 or reply_score >= SIMILARITY_THRESHOLD):
         reply_path = best_reply_entry.get("reply_image_path")
@@ -1003,6 +1054,31 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("Sorry, no match found.")
 
 
+# "$+" text command handler (moderators): reply to a photo with $+ to add it
+async def add_dollar_plus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    message = update.effective_message
+    if not is_moderator(user.id):
+        await message.reply_text("Only moderators can use this.")
+        return
+    if not message.reply_to_message or not message.reply_to_message.photo:
+        await message.reply_text("Reply $+ to a photo to add it.")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
+    largest = message.reply_to_message.photo[-1]
+    local_path = await download_photo_as_file(update, context, IMAGES_DIR, largest.file_id, fallback_suffix="_add")
+    if not local_path:
+        await message.reply_text("Failed to download the photo.")
+        return
+    try:
+        text = extract_text_for_add(local_path)
+    except Exception as e:
+        logger.exception("Add OCR failed: %s", e)
+        text = ""
+    add_entry_to_db(local_path, text)
+    await message.reply_text(f"Added image to database. Extracted text: {text or '(none)'}")
+
+
 # =====================
 # App bootstrap
 # =====================
@@ -1028,6 +1104,7 @@ def main() -> None:
     app.add_handler(manage_conv)
     app.add_handler(CommandHandler("addmapping", addmapping))
     app.add_handler(CommandHandler("add", add_command))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^\$\+$"), add_dollar_plus))
 
     # Photos with or without caption
     app.add_handler(MessageHandler(filters.PHOTO, photo_router))
