@@ -2,20 +2,17 @@
 """
 Telegram bot that:
 - Admin can add reference images via /add (attached as photo or by replying /add to a photo).
-- Any user can send a photo; the bot extracts yellow Chinese text using OpenCV OCR pipeline,
+- Any user can send a photo; the bot extracts yellow Chinese text using OpenCV + Cloud OCR,
   compares it with stored entries (FuzzyWuzzy), and returns the best matched reference image
   if similarity >= 80, otherwise replies that no match was found.
 
-OCR backends:
-- EasyOCR (default, requires PyTorch; heavy)
-- Tesseract fallback (lightweight). To force Tesseract, set env USE_TESSERACT=1 and install
-  system packages: tesseract-ocr tesseract-ocr-chi-sim
+OCR backend:
+- Cloud OCR (OCR.space). Requires an API key. This avoids heavy dependencies like PyTorch/Tesseract.
 
 Dependencies:
 - python-telegram-bot >= 20
 - opencv-python (or opencv-python-headless)
-- easyocr (optional if using Tesseract)
-- pytesseract (optional, for Tesseract fallback)
+- requests
 - fuzzywuzzy (optional: python-Levenshtein for speed)
 
 Run:
@@ -32,26 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-
-# OCR backend selection
-USE_TESSERACT_ENV = os.environ.get("USE_TESSERACT", "0") == "1"
-
-EASYOCR_AVAILABLE = False
-PYTESSERACT_AVAILABLE = False
-
-try:
-    if not USE_TESSERACT_ENV:
-        import easyocr  # type: ignore
-        EASYOCR_AVAILABLE = True
-except Exception:
-    EASYOCR_AVAILABLE = False
-
-try:
-    import pytesseract  # type: ignore
-    PYTESSERACT_AVAILABLE = True
-except Exception:
-    PYTESSERACT_AVAILABLE = False
-
+import requests
 from fuzzywuzzy import fuzz
 from telegram import Update
 from telegram.constants import ChatAction
@@ -71,6 +49,11 @@ BOT_TOKEN: str = "8217318799:AAF6SEzDub4f3QK7P5p76QL4uBMwalqI7WY"
 # Replace with your numeric Telegram user ID
 ADMIN_ID: int = 123456789
 
+# Cloud OCR config (OCR.space)
+OCR_API_KEY: str = os.environ.get("OCR_API_KEY", "K88956884888957")
+OCR_API_ENDPOINT: str = "https://api.ocr.space/parse/image"
+OCR_TIMEOUT_SECONDS: int = 30
+
 # Storage paths
 IMAGES_DIR: str = "images"
 DB_PATH: str = "database.json"
@@ -84,17 +67,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-# Initialize EasyOCR reader if available (Chinese simplified + English)
-# GPU=False is safer on most servers; set to True if you have GPU with proper drivers
-OCR_READER = None
-OCR_BACKEND = "tesseract" if USE_TESSERACT_ENV else ("easyocr" if EASYOCR_AVAILABLE else ("tesseract" if PYTESSERACT_AVAILABLE else "none"))
-if OCR_BACKEND == "easyocr":
-    try:
-        OCR_READER = easyocr.Reader(["ch_sim", "en"], gpu=False)  # type: ignore
-    except Exception as init_err:
-        logger.warning("Falling back to Tesseract due to EasyOCR init error: %s", init_err)
-        OCR_BACKEND = "tesseract" if PYTESSERACT_AVAILABLE else "none"
 
 
 # =====================
@@ -136,42 +108,68 @@ def yellow_mask_bgr(image_bgr: np.ndarray) -> np.ndarray:
     return mask
 
 
-def ocr_with_easyocr(image_np: np.ndarray) -> str:
-    results = OCR_READER.readtext(image_np, detail=0, paragraph=True)  # type: ignore
-    return " ".join([r.strip() for r in results if isinstance(r, str) and r.strip()])
-
-
-def ocr_with_tesseract(image_np: np.ndarray) -> str:
-    # Use Chinese Simplified; make sure tesseract-ocr-chi-sim is installed on the host
-    try:
-        text = pytesseract.image_to_string(image_np, lang="chi_sim")  # type: ignore
-    except pytesseract.TesseractNotFoundError:  # type: ignore
-        logger.error("Tesseract not found. Install tesseract-ocr and tesseract-ocr-chi-sim.")
+def ocr_with_cloud(image_np: np.ndarray) -> str:
+    """Call OCR.space API to extract Chinese Simplified text from the provided image array."""
+    # Encode to JPEG to reduce size
+    success, encoded = cv2.imencode(
+        ".jpg", image_np, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+    )
+    if not success:
         return ""
-    return " ".join(t.strip() for t in text.split())
+    data = {
+        "language": "chs",  # Chinese Simplified
+        "isOverlayRequired": "false",
+        "OCREngine": "2",
+        "scale": "true",
+    }
+    headers = {"apikey": OCR_API_KEY}
+    files = {
+        "file": ("image.jpg", encoded.tobytes(), "image/jpeg"),
+    }
+    try:
+        resp = requests.post(
+            OCR_API_ENDPOINT,
+            headers=headers,
+            data=data,
+            files=files,
+            timeout=OCR_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as e:
+        logger.error("Cloud OCR request failed: %s", e)
+        return ""
+
+    try:
+        if payload.get("IsErroredOnProcessing"):
+            logger.warning("OCR error: %s", payload.get("ErrorMessage"))
+            return ""
+        results = payload.get("ParsedResults", [])
+        texts: List[str] = []
+        for r in results:
+            t = r.get("ParsedText", "")
+            if t:
+                texts.append(t)
+        combined = " ".join(s.strip() for s in texts if s.strip())
+        return combined
+    except Exception as e:
+        logger.error("Cloud OCR parse failed: %s", e)
+        return ""
 
 
 def extract_text_from_image(image_path: str) -> str:
-    """Extract Chinese text by isolating yellow regions and running OCR backend."""
+    """Extract Chinese text by isolating yellow regions and running Cloud OCR."""
     image = cv2.imread(image_path)
     if image is None:
         return ""
 
     mask = yellow_mask_bgr(image)
-    # Apply mask to original image to keep only yellow areas
     masked = cv2.bitwise_and(image, image, mask=mask)
 
-    # Convert to grayscale + threshold to increase contrast for OCR
     gray = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
-    if OCR_BACKEND == "easyocr":
-        return ocr_with_easyocr(thresh)
-    elif OCR_BACKEND == "tesseract":
-        return ocr_with_tesseract(thresh)
-    else:
-        logger.error("No OCR backend available. Install EasyOCR or Tesseract + pytesseract.")
-        return ""
+    return ocr_with_cloud(thresh)
 
 
 def add_entry_to_db(image_path: str, text: str) -> None:
@@ -316,7 +314,7 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     query_text = extract_text_from_image(tmp_path)
     best_entry, best_score = find_best_match(query_text)
 
-    logger.info("OCR backend: %s | Query text: %s | Best score: %s", OCR_BACKEND, query_text, best_score)
+    logger.info("Cloud OCR | Query text: %s | Best score: %s", query_text, best_score)
 
     if best_entry and best_score >= SIMILARITY_THRESHOLD:
         image_path = best_entry.get("image_path")
@@ -420,9 +418,6 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def main() -> None:
     ensure_storage()
 
-    if OCR_BACKEND == "none":
-        logger.error("No OCR backend available. Install EasyOCR (heavy) or Tesseract + pytesseract (light).")
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -434,7 +429,7 @@ def main() -> None:
     # Images sent as documents
     app.add_handler(MessageHandler(filters.Document.ALL, document_router))
 
-    logger.info("Bot is starting... Using OCR backend: %s", OCR_BACKEND)
+    logger.info("Bot is starting... Using OCR backend: cloud (OCR.space)")
     app.run_polling(close_loop=False)
 
 
