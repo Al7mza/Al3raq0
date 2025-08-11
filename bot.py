@@ -71,7 +71,7 @@ if _env_mods:
         pass
 
 # Cloud OCR config (OCR.space)
-OCR_API_KEY: str = os.environ.get("OCR_API_KEY", "K88956884888957")
+OCR_API_KEY: str = os.environ.get("OCR_API_KEY", "K86394806188957")
 OCR_API_ENDPOINT: str = "https://api.ocr.space/parse/image"
 OCR_TIMEOUT_SECONDS: int = 30
 
