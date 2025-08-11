@@ -94,6 +94,20 @@ YELLOW_UPPER_S = int(os.environ.get("YELLOW_UPPER_S", "255"))
 YELLOW_UPPER_V = int(os.environ.get("YELLOW_UPPER_V", "255"))
 BOTTOM_RATIO = float(os.environ.get("BOTTOM_RATIO", "0.3"))  # bottom 30% band
 
+# Red detection HSV ranges (wrap-around)
+RED_LOWER1_H = int(os.environ.get("RED_LOWER1_H", "0"))
+RED_LOWER1_S = int(os.environ.get("RED_LOWER1_S", "80"))
+RED_LOWER1_V = int(os.environ.get("RED_LOWER1_V", "80"))
+RED_UPPER1_H = int(os.environ.get("RED_UPPER1_H", "10"))
+RED_UPPER1_S = int(os.environ.get("RED_UPPER1_S", "255"))
+RED_UPPER1_V = int(os.environ.get("RED_UPPER1_V", "255"))
+RED_LOWER2_H = int(os.environ.get("RED_LOWER2_H", "170"))
+RED_LOWER2_S = int(os.environ.get("RED_LOWER2_S", "80"))
+RED_LOWER2_V = int(os.environ.get("RED_LOWER2_V", "80"))
+RED_UPPER2_H = int(os.environ.get("RED_UPPER2_H", "180"))
+RED_UPPER2_S = int(os.environ.get("RED_UPPER2_S", "255"))
+RED_UPPER2_V = int(os.environ.get("RED_UPPER2_V", "255"))
+
 # Storage paths
 IMAGES_DIR: str = "images"
 DB_PATH: str = "database.json"
@@ -229,6 +243,21 @@ def yellow_mask_bgr(image_bgr: np.ndarray) -> np.ndarray:
     lower = np.array([YELLOW_LOWER_H, YELLOW_LOWER_S, YELLOW_LOWER_V])
     upper = np.array([YELLOW_UPPER_H, YELLOW_UPPER_S, YELLOW_UPPER_V])
     mask = cv2.inRange(hsv, lower, upper)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    return mask
+
+def red_mask_bgr(image_bgr: np.ndarray) -> np.ndarray:
+    """Build a mask for red regions using two HSV ranges (wrap-around)."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    lower1 = np.array([RED_LOWER1_H, RED_LOWER1_S, RED_LOWER1_V])
+    upper1 = np.array([RED_UPPER1_H, RED_UPPER1_S, RED_UPPER1_V])
+    lower2 = np.array([RED_LOWER2_H, RED_LOWER2_S, RED_LOWER2_V])
+    upper2 = np.array([RED_UPPER2_H, RED_UPPER2_S, RED_UPPER2_V])
+    mask1 = cv2.inRange(hsv, lower1, upper1)
+    mask2 = cv2.inRange(hsv, lower2, upper2)
+    mask = cv2.bitwise_or(mask1, mask2)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.dilate(mask, kernel, iterations=1)
@@ -498,6 +527,56 @@ def extract_yellow_text(image_path: str) -> str:
         return ""
     return max(candidates, key=lambda s: (count_cjk(s), len(s)))
 
+def extract_red_text(image_path: str) -> str:
+    """Extract Chinese text focusing on red content across the whole image (ROIs + masked)."""
+    image = cv2.imread(image_path)
+    if image is None:
+        return ""
+    mask = red_mask_bgr(image)
+    candidates: List[str] = []
+    calls = 0
+    # ROI-based
+    for roi in find_rois_from_mask(image, mask):
+        if calls >= MAX_OCR_CALLS:
+            break
+        t = ocr_with_cloud(to_thresh(roi))
+        calls += 1
+        if not t and calls < MAX_OCR_CALLS:
+            t = ocr_with_cloud(roi)
+            calls += 1
+        if t:
+            candidates.append(t)
+            if count_cjk(t) >= 3:
+                break
+    # Full masked
+    masked = cv2.bitwise_and(image, image, mask=mask)
+    t_mask = None
+    if calls < MAX_OCR_CALLS:
+        t_mask = ocr_with_cloud(to_thresh(masked))
+        calls += 1
+    if not t_mask and calls < MAX_OCR_CALLS:
+        t_mask = ocr_with_cloud(masked)
+        calls += 1
+    if t_mask:
+        candidates.append(t_mask)
+        if count_cjk(t_mask) < 3 and calls < MAX_OCR_CALLS:
+            masked_th = to_thresh(masked)
+            rot1 = cv2.rotate(masked_th, cv2.ROTATE_90_CLOCKWISE)
+            rot2 = cv2.rotate(masked_th, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            for rot in (rot1, rot2):
+                if calls >= MAX_OCR_CALLS:
+                    break
+                tr = ocr_with_cloud(rot)
+                calls += 1
+                if tr:
+                    candidates.append(tr)
+                    if count_cjk(tr) >= 3:
+                        break
+
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda s: (count_cjk(s), len(s)))
+
 
 def extract_bottom_yellow_text(image_path: str) -> str:
     """Extract Chinese text from bottom band focusing on yellow (admin references often at bottom)."""
@@ -531,7 +610,10 @@ def extract_bottom_yellow_text(image_path: str) -> str:
 
 
 def extract_text_for_add(image_path: str) -> str:
-    """Admin add: use robust full-image OCR only (color-agnostic)."""
+    """Admin add: prefer red-text OCR, fallback to robust full-image OCR."""
+    text_red = extract_red_text(image_path)
+    if text_red:
+        return text_red
     return extract_text_from_image(image_path)
 
 
