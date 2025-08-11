@@ -32,6 +32,7 @@ import numpy as np
 import requests
 import re
 import jieba
+from deep_translator import GoogleTranslator
 from hanziconv import HanziConv
 from fuzzywuzzy import fuzz
 from telegram import Update
@@ -130,6 +131,10 @@ MIN_SIMILARITY_FALLBACK: int = int(os.environ.get("MIN_SIMILARITY_FALLBACK", "70
 MIN_LCS_ACCEPT: int = int(os.environ.get("MIN_LCS_ACCEPT", "2"))
 CENTER_RATIO: float = float(os.environ.get("CENTER_RATIO", "0.5"))
 
+# Translation settings
+ENABLE_TRANSLATION: bool = os.environ.get("ENABLE_TRANSLATION", "1") == "1"
+TRANSLATE_TARGET_LANG: str = os.environ.get("TRANSLATE_TARGET_LANG", "en")
+
 # Initialize logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -214,6 +219,18 @@ def tokenize_chinese(text: str) -> List[str]:
 def tokens_to_string(tokens: List[str]) -> str:
     # Join tokens with spaces for token-based fuzzy matching
     return " ".join(tokens)
+
+def get_tail_tokens(text: str, k: int = 2) -> List[str]:
+    """Return the last k meaningful tokens from Chinese/alpha-numeric text."""
+    if not text:
+        return []
+    simple = to_simplified(text)
+    toks = [t.strip() for t in jieba.lcut(simple) if t and (any("\u4e00" <= ch <= "\u9fff" for ch in t) or any(c.isalnum() for c in t))]
+    if not toks:
+        # fallback to last k CJK sequences
+        cjk_seq = re.findall(r"[\u4e00-\u9fff]+", simple)
+        toks = cjk_seq
+    return toks[-k:] if len(toks) >= k else toks
 
 
 def ngram_set(text: str, n: int = 2) -> set:
@@ -713,16 +730,36 @@ def compute_similarity(query_text: str, candidate_text: str) -> int:
     score = int(round(min(100.0, max(0.0, weighted))))
     return score
 
+# Translation cache to reduce repeated calls
+_translate_cache: Dict[Tuple[str, str], str] = {}
+
+def translate_text(text: str, target_lang: str = TRANSLATE_TARGET_LANG) -> str:
+    if not ENABLE_TRANSLATION or not text:
+        return ""
+    key = (text, target_lang)
+    if key in _translate_cache:
+        return _translate_cache[key]
+    try:
+        tr = GoogleTranslator(source='auto', target=target_lang).translate(text)
+        if tr:
+            _translate_cache[key] = tr
+            return tr
+    except Exception:
+        return ""
+    return ""
+
 
 def add_entry_to_db(image_path: str, text: str) -> None:
     db = load_database()
     norm_text = normalize_text(text)
     tokens = sorted(list(build_token_set(text))) if text else []
+    tail_tokens = get_tail_tokens(text, k=2)
     entry = {
         "image_path": image_path,
         "text": text,
         "norm_text": norm_text,
         "tokens": tokens,
+        "tail_tokens": tail_tokens,
         "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
     db.append(entry)
@@ -733,10 +770,12 @@ def add_text_reply_to_db(trigger_text: str, reply_image_path: str) -> None:
     db = load_text_replies()
     norm_text = normalize_text(trigger_text)
     tokens = sorted(list(build_token_set(trigger_text))) if trigger_text else []
+    tail_tokens = get_tail_tokens(trigger_text, k=2)
     entry = {
         "text": trigger_text,
         "norm_text": norm_text,
         "tokens": tokens,
+        "tail_tokens": tail_tokens,
         "reply_image_path": reply_image_path,
         "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
@@ -765,6 +804,7 @@ def find_best_match(query_text: str) -> Tuple[Optional[Dict[str, Any]], int, int
         candidate_text = entry.get("text", "") or ""
         candidate_norm = entry.get("norm_text") or normalize_text(candidate_text)
         entry_tokens = set(entry.get("tokens") or build_token_set(candidate_text))
+        entry_tail = set(entry.get("tail_tokens") or get_tail_tokens(candidate_text, k=2))
 
         # token overlap
         overlap = len(query_tokens & entry_tokens)
@@ -775,13 +815,21 @@ def find_best_match(query_text: str) -> Tuple[Optional[Dict[str, Any]], int, int
         # LCS on normalized strings
         lcs_len = longest_common_substring_length(query_norm, candidate_norm)
 
+        # Translation-assisted similarity (English)
+        qe = translate_text(query_text)
+        ce = translate_text(candidate_text)
+        sim_en = compute_similarity(qe, ce) if qe and ce else 0
+
         # overall ranking score prioritizing overlap then similarity
-        overall = overlap * 200 + lcs_len * 50 + sim_score
+        # Tail match bonus if query tail matches entry tail
+        query_tail = set(get_tail_tokens(query_text, k=2))
+        tail_overlap = len(query_tail & entry_tail)
+        overall = tail_overlap * 2000 + overlap * 300 + lcs_len * 80 + max(sim_score, sim_en)
 
         if overall > best_overall_score:
             best_overall_score = overall
             best_entry = entry
-            best_sim_score = sim_score
+            best_sim_score = max(sim_score, sim_en)
             best_tok_overlap = overlap
             best_lcs_len = lcs_len
 
@@ -804,16 +852,22 @@ def find_best_text_reply(query_text: str) -> Tuple[Optional[Dict[str, Any]], int
     for entry in db:
         candidate_text = entry.get("text", "") or ""
         entry_tokens = set(entry.get("tokens") or build_token_set(candidate_text))
+        entry_tail = set(entry.get("tail_tokens") or get_tail_tokens(candidate_text, k=2))
         overlap = len(query_tokens & entry_tokens)
         sim_score = compute_similarity(query_text, candidate_text)
         # approximate LCS on normalized strings
         candidate_norm = normalize_text(candidate_text)
         lcs_len = longest_common_substring_length(normalize_text(query_text), candidate_norm)
-        overall = overlap * 200 + lcs_len * 50 + sim_score
+        qe = translate_text(query_text)
+        ce = translate_text(candidate_text)
+        sim_en = compute_similarity(qe, ce) if qe and ce else 0
+        query_tail = set(get_tail_tokens(query_text, k=2))
+        tail_overlap = len(query_tail & entry_tail)
+        overall = tail_overlap * 2000 + overlap * 300 + lcs_len * 80 + max(sim_score, sim_en)
         if overall > best_overall_score:
             best_overall_score = overall
             best_entry = entry
-            best_sim_score = sim_score
+            best_sim_score = max(sim_score, sim_en)
             best_tok_overlap = overlap
     return best_entry, best_sim_score if best_entry else 0, max(0, best_tok_overlap)
 
@@ -1038,7 +1092,11 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     try:
-        query_text = extract_text_for_query(tmp_path)
+        # Extract yellow (gold) and full
+        query_yellow = extract_yellow_text(tmp_path)
+        query_full = extract_text_for_query(tmp_path)
+        # Prefer yellow tail for matching, but pass full text into find_best_* which computes tails too
+        query_text = query_yellow if query_yellow else query_full
     except Exception as e:
         logger.exception("Query OCR failed: %s", e)
         await message.reply_text("Sorry, OCR failed. Please try another image or later.")
@@ -1147,7 +1205,9 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     try:
-        query_text = extract_text_for_query(local_path)
+        query_yellow = extract_yellow_text(local_path)
+        query_full = extract_text_for_query(local_path)
+        query_text = query_yellow if query_yellow else query_full
     except Exception as e:
         logger.exception("Query OCR failed: %s", e)
         await message.reply_text("Sorry, OCR failed. Please try another image or later.")
@@ -1252,6 +1312,9 @@ def refresh_database_texts_on_startup() -> None:
             updated = True
         if "tokens" not in entry:
             entry["tokens"] = sorted(list(build_token_set(text))) if text else []
+            updated = True
+        if "tail_tokens" not in entry:
+            entry["tail_tokens"] = get_tail_tokens(text, k=2)
             updated = True
     if updated:
         save_database(db)
