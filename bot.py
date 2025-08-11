@@ -527,40 +527,12 @@ def extract_bottom_yellow_text(image_path: str) -> str:
 
 
 def extract_text_for_add(image_path: str) -> str:
-    """Admin add: prefer robust full-image OCR; also consider yellow/bottom as hints.
-    Pick the best text among candidates regardless of color.
-    """
-    # Try full-image variants first
-    image = cv2.imread(image_path)
-    candidates: List[str] = []
-    calls = 0
-    if image is not None:
-        for variant in preprocess_variants_full(image):
-            if calls >= MAX_OCR_CALLS:
-                break
-            t = ocr_with_cloud(variant)
-            calls += 1
-            if t:
-                candidates.append(t)
-                if count_cjk(t) >= 4:
-                    break
-    # Add yellow pipelines as additional candidates
-    y1 = extract_bottom_yellow_text(image_path)
-    if y1:
-        candidates.append(y1)
-    y2 = extract_yellow_text(image_path)
-    if y2:
-        candidates.append(y2)
-    if not candidates:
-        return ""
-    return max(candidates, key=lambda s: (count_cjk(s), len(s)))
+    """Admin add: use robust full-image OCR only (color-agnostic)."""
+    return extract_text_from_image(image_path)
 
 
 def extract_text_for_query(image_path: str) -> str:
-    """User query: prefer yellow text across the whole image; fallback to full-image variants."""
-    text = extract_yellow_text(image_path)
-    if text:
-        return text
+    """User query: use robust full-image OCR only (color-agnostic)."""
     return extract_text_from_image(image_path)
 
 
@@ -719,7 +691,7 @@ def is_moderator(user_id: Optional[int]) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Send a photo containing yellow Chinese text. Admin can add reference images using /add."
+        "Send a photo with Chinese text. Admins can add reference images using /add or $+."
     )
 
 
@@ -848,9 +820,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         text = extract_text_for_add(local_path)
         add_entry_to_db(local_path, text)
-        await message.reply_text(
-            f"Added image to database. Extracted text: {text or '(none)'}"
-        )
+        await message.reply_text("Added image to database.")
         return
 
     # Case 2: If /add was sent standalone, instruct admin how to use it
@@ -892,9 +862,7 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             logger.exception("Add OCR failed: %s", e)
             text = ""
         add_entry_to_db(local_path, text)
-        await message.reply_text(
-            f"Added image to database. Extracted text: {text or '(none)'}"
-        )
+        await message.reply_text("Added image to database.")
         return
 
     # User query flow
@@ -991,9 +959,7 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.exception("Add OCR failed: %s", e)
             text = ""
         add_entry_to_db(local_path, text)
-        await message.reply_text(
-            f"Added image to database. Extracted text: {text or '(none)'}"
-        )
+        await message.reply_text("Added image to database.")
         return
 
     # User query flow for document image
@@ -1076,7 +1042,7 @@ async def add_dollar_plus(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.exception("Add OCR failed: %s", e)
         text = ""
     add_entry_to_db(local_path, text)
-    await message.reply_text(f"Added image to database. Extracted text: {text or '(none)'}")
+    await message.reply_text("Added image to database.")
 
 
 # =====================
