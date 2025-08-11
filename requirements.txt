@@ -6,3 +6,4 @@ fuzzywuzzy
 python-Levenshtein; platform_python_implementation != 'PyPy'
 jieba
 hanziconv
+deep-translator
