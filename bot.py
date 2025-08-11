@@ -99,7 +99,7 @@ BOTTOM_RATIO = float(os.environ.get("BOTTOM_RATIO", "0.3"))  # bottom 30% band
 
 # Red detection HSV ranges (wrap-around)
 RED_LOWER1_H = int(os.environ.get("RED_LOWER1_H", "0"))
-RED_LOWER1_S = int(os.environ.get("RED_LOWER1_S", "80"))
+RED_LOWER1_S = int(os.environ.get("RED_LOER1_S", "80")) if os.environ.get("RED_LOER1_S") else int(os.environ.get("RED_LOWER1_S", "80"))
 RED_LOWER1_V = int(os.environ.get("RED_LOWER1_V", "80"))
 RED_UPPER1_H = int(os.environ.get("RED_UPPER1_H", "10"))
 RED_UPPER1_S = int(os.environ.get("RED_UPPER1_S", "255"))
@@ -141,6 +141,9 @@ TRANSLATE_TARGET_LANG: str = os.environ.get("TRANSLATE_TARGET_LANG", "en")
 BAIDU_API_KEY: str = os.environ.get("BAIDU_OCR_API_KEY", "")
 BAIDU_SECRET_KEY: str = os.environ.get("BAIDU_OCR_SECRET_KEY", "")
 _baidu_token: Dict[str, Any] = {"token": None, "expires_at": 0.0}
+
+# Google Vision OCR settings
+GOOGLE_VISION_API_KEY: str = os.environ.get("GOOGLE_VISION_API_KEY", "AIzaSyBiW7vLyDMRpcZcWdawzmPXjZqL5rSsl1k")
 
 # Initialize logging
 logging.basicConfig(
@@ -437,21 +440,28 @@ def scan_tiles(image_bgr: np.ndarray, rows: int = 2, cols: int = 2) -> List[np.n
 
 
 def ocr_with_cloud(image_np: np.ndarray) -> str:
-    """Try Baidu OCR first (high-accuracy Chinese), then OCR.space (engine 2->1)."""
+    """Try Google Vision first, then Baidu, then OCR.space (engine 2->1)."""
     success, encoded = cv2.imencode(
         ".jpg", image_np, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
     )
     if not success:
         return ""
 
-    # 1) Baidu OCR
+    # 1) Google Vision OCR
+    gcv_text = ""
+    if GOOGLE_VISION_API_KEY:
+        gcv_text = ocr_with_google_bytes(encoded.tobytes())
+        if count_cjk(gcv_text) >= 2:
+            return gcv_text
+
+    # 2) Baidu OCR
     baidu_text = ""
     if BAIDU_API_KEY and BAIDU_SECRET_KEY:
         baidu_text = ocr_with_baidu_bytes(encoded.tobytes())
         if count_cjk(baidu_text) >= 2:
             return baidu_text
 
-    # 2) OCR.space
+    # 3) OCR.space
     headers = {"apikey": OCR_API_KEY}
     files = {"file": ("image.jpg", encoded.tobytes(), "image/jpeg")}
 
@@ -497,6 +507,39 @@ def ocr_with_cloud(image_np: np.ndarray) -> str:
         return text2
     text1 = call_engine(1) if not text2 else text2
     return text1
+
+# Google Vision OCR via REST API
+def ocr_with_google_bytes(jpeg_bytes: bytes) -> str:
+    try:
+        img_b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+        req = {
+            "requests": [
+                {
+                    "image": {"content": img_b64},
+                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+                    "imageContext": {
+                        "languageHints": ["zh", "zh-Hans", "zh-Hant", "en"]
+                    },
+                }
+            ]
+        }
+        resp = requests.post(
+            f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}",
+            json=req,
+            timeout=OCR_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        anns = (data.get("responses") or [{}])[0]
+        text = ""
+        if "fullTextAnnotation" in anns and anns["fullTextAnnotation"].get("text"):
+            text = anns["fullTextAnnotation"]["text"]
+        elif "textAnnotations" in anns and anns["textAnnotations"]:
+            text = anns["textAnnotations"][0].get("description", "")
+        return text.strip()
+    except Exception as e:
+        logger.warning("Google Vision OCR error: %s", e)
+        return ""
 
 def baidu_get_token() -> Optional[str]:
     now = time.time()
