@@ -1,26 +1,27 @@
 import os
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
 # Bot Configuration
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_USER_IDS = [int(id.strip()) for id in os.getenv('ADMIN_USER_IDS', '').split(',') if id.strip()]
+BOT_TOKEN = os.getenv('BOT_TOKEN', '8217318799:AAF6SEzDub4f3QK7P5p76QL4uBMwalqI7WY')
+ADMIN_USER_IDS = [int(x.strip()) for x in os.getenv('ADMIN_USER_IDS', '1694244496').split(',') if x.strip()]
+
+# File Configuration
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp'}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+# Database Configuration
+DATABASE_PATH = 'treasure_map.db'
 
 # OCR Configuration
-DEFAULT_LANGUAGE = 'chi_sim+eng'  # Chinese simplified + English
+DEFAULT_LANGUAGE = 'eng+chi_sim'  # English + Chinese Simplified
 TESSERACT_CONFIG = '--psm 6 --oem 3'
 
 # Similarity Configuration
-DEFAULT_SIMILARITY_THRESHOLD = 15  # 15%
-
-# Database Configuration
-DATABASE_PATH = 'treasure_maps.db'
-
-# File Storage
-UPLOAD_FOLDER = 'uploads'
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp'}
+DEFAULT_SIMILARITY_THRESHOLD = 15.0  # 15% minimum similarity
 
 # Create uploads directory if it doesn't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
