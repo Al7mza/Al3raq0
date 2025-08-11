@@ -11,6 +11,10 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
+# Check Python version
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+echo "✅ Python version: $PYTHON_VERSION"
+
 # Check if pip3 is installed
 if ! command -v pip3 &> /dev/null; then
     echo "❌ pip3 is not installed. Please install pip3 first."
@@ -35,15 +39,45 @@ sudo apt-get install -y libgl1-mesa-glx libglib2.0-0
 
 echo "✅ System dependencies installed"
 
-# Install Python dependencies
+# Try different installation methods based on Python version
 echo "🐍 Installing Python dependencies..."
-pip3 install -r requirements.txt
 
-if [ $? -eq 0 ]; then
-    echo "✅ Python dependencies installed successfully"
+# Method 1: Try main requirements
+echo "🔍 Trying main requirements.txt..."
+if pip3 install -r requirements.txt; then
+    echo "✅ Main requirements installed successfully"
 else
-    echo "❌ Failed to install Python dependencies"
-    exit 1
+    echo "⚠️  Main requirements failed, trying alternative method..."
+    
+    # Method 2: Try alternative requirements for Python 3.13+
+    if [ -f "requirements-python313.txt" ]; then
+        echo "🔍 Trying Python 3.13+ compatible requirements..."
+        if pip3 install -r requirements-python313.txt; then
+            echo "✅ Alternative requirements installed successfully"
+        else
+            echo "⚠️  Alternative requirements failed, trying minimal installation..."
+            
+            # Method 3: Install packages one by one
+            echo "🔍 Installing packages individually..."
+            pip3 install python-telegram-bot
+            pip3 install Pillow
+            pip3 install opencv-python-headless
+            pip3 install numpy
+            pip3 install pytesseract
+            pip3 install python-dotenv
+            
+            # Try fuzzy matching packages
+            if ! pip3 install fuzzywuzzy python-Levenshtein; then
+                echo "⚠️  Installing rapidfuzz as alternative..."
+                pip3 install rapidfuzz
+            fi
+            
+            echo "✅ Individual packages installed"
+        fi
+    else
+        echo "❌ Alternative requirements file not found"
+        exit 1
+    fi
 fi
 
 # Create .env file if it doesn't exist
@@ -75,3 +109,8 @@ echo "3. Test the bot: python3 test_bot.py"
 echo "4. Run the bot: python3 bot.py"
 echo ""
 echo "📚 For help, see README.md or run: python3 demo.py"
+echo ""
+echo "🔧 If you encounter issues:"
+echo "- Try running: python3 test_bot.py"
+echo "- Check Python version compatibility"
+echo "- Install missing packages manually if needed"

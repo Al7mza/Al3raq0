@@ -38,6 +38,20 @@ python3 test_bot.py
 python3 bot.py
 ```
 
+## 🔧 **Python 3.13+ Compatibility**
+
+If you're getting build errors with Python 3.13+, use the simplified version:
+
+```bash
+# Install only essential packages
+pip3 install python-telegram-bot python-dotenv Pillow
+
+# Run simplified bot (Python 3.13+ compatible)
+python3 bot-simple.py
+```
+
+**See `INSTALLATION_GUIDE.md` for detailed troubleshooting!**
+
 ## 📋 Commands
 
 ### Admin Commands
@@ -60,6 +74,7 @@ python3 bot.py
 ## 📁 Files
 
 - `bot.py` - Main bot application
+- `bot-simple.py` - **Simplified bot for Python 3.13+**
 - `config.py` - Configuration settings
 - `database.py` - Database operations
 - `ocr_handler.py` - OCR text extraction
@@ -67,6 +82,9 @@ python3 bot.py
 - `setup.sh` - Automated setup script
 - `test_bot.py` - Component testing
 - `requirements.txt` - Python dependencies
+- `requirements-python313.txt` - **Alternative dependencies for Python 3.13+**
+- `requirements-minimal.txt` - **Minimal dependencies**
+- `INSTALLATION_GUIDE.md` - **Troubleshooting guide**
 
 ## 🎯 How It Works
 
@@ -84,12 +102,35 @@ Combines multiple text matching approaches:
 - Keyword overlap analysis
 - Configurable weights for optimal results
 
+## 🚨 **Troubleshooting**
+
+### Build Errors (Python 3.13+)
+```bash
+# Use simplified bot instead
+python3 bot-simple.py
+
+# Or install with pre-compiled wheels
+pip3 install --only-binary=all python-telegram-bot python-dotenv Pillow
+```
+
+### Missing Dependencies
+```bash
+# Try alternative requirements
+pip3 install -r requirements-python313.txt
+
+# Or minimal installation
+pip3 install -r requirements-minimal.txt
+```
+
+### Full Troubleshooting Guide
+See `INSTALLATION_GUIDE.md` for step-by-step solutions!
+
 ## 📞 Support
 
-For issues or questions, check the test output or run:
-```bash
-python3 test_bot.py
-```
+For issues or questions:
+1. Check `INSTALLATION_GUIDE.md`
+2. Run: `python3 test_bot.py`
+3. Try the simplified bot: `python3 bot-simple.py`
 
 ## 📝 License
 

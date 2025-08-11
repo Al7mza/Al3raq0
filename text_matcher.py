@@ -1,6 +1,17 @@
-from fuzzywuzzy import fuzz
 import re
 from typing import List, Dict, Optional
+
+# Try to import fuzzywuzzy, fallback to rapidfuzz or built-in
+try:
+    from fuzzywuzzy import fuzz
+    FUZZY_AVAILABLE = True
+except ImportError:
+    try:
+        from rapidfuzz import fuzz
+        FUZZY_AVAILABLE = True
+    except ImportError:
+        FUZZY_AVAILABLE = False
+        print("Warning: fuzzywuzzy and rapidfuzz not available, using built-in text matching")
 
 class TextMatcher:
     def __init__(self):
@@ -19,19 +30,37 @@ class TextMatcher:
         norm_text1 = self.normalize_text(text1)
         norm_text2 = self.normalize_text(text2)
         
-        # Calculate different similarity metrics
-        ratio = fuzz.ratio(norm_text1, norm_text2)
-        partial_ratio = fuzz.partial_ratio(norm_text1, norm_text2)
-        token_sort_ratio = fuzz.token_sort_ratio(norm_text1, norm_text2)
-        token_set_ratio = fuzz.token_set_ratio(norm_text1, norm_text2)
-        
-        # Weighted average (can be adjusted based on needs)
-        weights = [0.3, 0.2, 0.25, 0.25]  # ratio, partial, token_sort, token_set
-        similarities = [ratio, partial_ratio, token_sort_ratio, token_set_ratio]
-        
-        weighted_similarity = sum(w * s for w, s in zip(weights, similarities))
+        if FUZZY_AVAILABLE:
+            # Use fuzzy matching if available
+            ratio = fuzz.ratio(norm_text1, norm_text2)
+            partial_ratio = fuzz.partial_ratio(norm_text1, norm_text2)
+            token_sort_ratio = fuzz.token_sort_ratio(norm_text1, norm_text2)
+            token_set_ratio = fuzz.token_set_ratio(norm_text1, norm_text2)
+            
+            # Weighted average
+            weights = [0.3, 0.2, 0.25, 0.25]
+            similarities = [ratio, partial_ratio, token_sort_ratio, token_set_ratio]
+            weighted_similarity = sum(w * s for w, s in zip(weights, similarities))
+        else:
+            # Fallback to built-in similarity
+            weighted_similarity = self.built_in_similarity(norm_text1, norm_text2)
         
         return weighted_similarity
+    
+    def built_in_similarity(self, text1: str, text2: str) -> float:
+        """Built-in similarity calculation using difflib and other methods"""
+        import difflib
+        
+        # Sequence matcher similarity
+        seq_similarity = difflib.SequenceMatcher(None, text1, text2).ratio() * 100
+        
+        # Keyword overlap similarity
+        keyword_sim = self.keyword_based_similarity(text1, text2)
+        
+        # Combined similarity
+        combined = (seq_similarity * 0.7) + (keyword_sim * 0.3)
+        
+        return combined
     
     def normalize_text(self, text: str) -> str:
         """Normalize text for better comparison"""
@@ -173,11 +202,18 @@ class TextMatcher:
     
     def get_similarity_breakdown(self, text1: str, text2: str) -> Dict:
         """Get detailed breakdown of similarity calculations"""
-        return {
-            'ratio': fuzz.ratio(text1, text2),
-            'partial_ratio': fuzz.partial_ratio(text1, text2),
-            'token_sort_ratio': fuzz.token_sort_ratio(text1, text2),
-            'token_set_ratio': fuzz.token_set_ratio(text1, text2),
-            'keyword_similarity': self.keyword_based_similarity(text1, text2),
-            'combined_similarity': self.combined_similarity(text1, text2)
-        }
+        if FUZZY_AVAILABLE:
+            return {
+                'ratio': fuzz.ratio(text1, text2),
+                'partial_ratio': fuzz.partial_ratio(text1, text2),
+                'token_sort_ratio': fuzz.token_sort_ratio(text1, text2),
+                'token_set_ratio': fuzz.token_set_ratio(text1, text2),
+                'keyword_similarity': self.keyword_based_similarity(text1, text2),
+                'combined_similarity': self.combined_similarity(text1, text2)
+            }
+        else:
+            return {
+                'built_in_similarity': self.built_in_similarity(text1, text2),
+                'keyword_similarity': self.keyword_based_similarity(text1, text2),
+                'combined_similarity': self.combined_similarity(text1, text2)
+            }
